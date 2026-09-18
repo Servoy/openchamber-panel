@@ -1,0 +1,42 @@
+{
+  "name": "@servoy/kiro-usage-panel",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "OpenChamber panel showing AWS Kiro credit usage for the opencode-kiro-auth plugin",
+  "scripts": {
+    "build": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=1.24.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "kiro-usage",
+        "name": "Kiro Usage",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "page": true,
+      "capabilities": ["sessions"],
+      "filesystem": ["~/.config/opencode/kiro-usage.json"],
+      "integration": {
+        "name": "npm registry",
+        "description": "Checks the latest published opencode-kiro-auth version to flag an outdated install. Public registry; no token needed.",
+        "token": {
+          "apiOrigin": "https://registry.npmjs.org",
+          "scheme": "bearer"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@openchamber/sdk": "^1.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
