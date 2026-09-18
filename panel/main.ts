@@ -114,6 +114,12 @@ const clear = () => {
 const baselines = new Map<string, Baseline>()
 // The current OpenChamber session id, to highlight its row in the session list.
 let currentSessionId: string | null = null
+// The active session's title from the host, used to name its row when the
+// plugin has not recorded a title yet (a brand-new session shows only its id).
+let currentSessionTitle: string | null = null
+// Titles seen per session id via the host, kept so a row keeps a readable name
+// even after it stops being the active session.
+const sessionTitles = new Map<string, string>()
 // The latest published plugin version, fetched from npm at most hourly.
 let latestVersion: string | null = null
 let latestVersionCheckedAt = 0
@@ -306,6 +312,21 @@ function renderSessions(
   )
 }
 
+/**
+ * The best readable name for a session row, in priority order:
+ * the plugin's recorded title, the host title (for the active/known session),
+ * the directory basename, then a short session id — never the full raw id.
+ */
+function sessionName(s: SessionUsage, isCurrent: boolean): string {
+  const hostTitle = isCurrent ? currentSessionTitle : sessionTitles.get(s.sessionId)
+  const title = s.title || (hostTitle && hostTitle !== s.sessionId ? hostTitle : undefined)
+  if (title) return title
+  const dir = s.directory?.split('/').pop()
+  if (dir) return dir
+  // Fall back to a short, tidy id rather than the full session-… string.
+  return s.sessionId.replace(/^session-/, '').slice(0, 8)
+}
+
 /** One session row: name, path, a credit-share bar, and the credit/req figures. */
 function renderSessionRow(
   container: HTMLElement,
@@ -314,7 +335,7 @@ function renderSessionRow(
   emailById: Map<string, string>
 ): void {
   const isCurrent = currentSessionId != null && s.sessionId === currentSessionId
-  const name = s.title || s.directory?.split('/').pop() || s.sessionId.slice(0, 12)
+  const name = sessionName(s, isCurrent)
 
   const row = container.appendChild(el('button', `srow${isCurrent ? ' current' : ''}`))
   row.setAttribute('type', 'button')
@@ -666,7 +687,14 @@ host.onReady((ctx) => {
 
 host.onSession((session) => {
   const next = session?.id ?? null
-  if (next === currentSessionId) return
+  // Remember the title, even a fallback-to-id one, so a freshly started session
+  // gets a readable row before the plugin records its own title.
+  if (session?.id && session.title && session.title !== session.id) {
+    sessionTitles.set(session.id, session.title)
+  }
+  const nextTitle = session?.title ?? null
+  if (next === currentSessionId && nextTitle === currentSessionTitle) return
   currentSessionId = next
+  currentSessionTitle = nextTitle
   void paint(true)
 })

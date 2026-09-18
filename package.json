@@ -1,6 +1,6 @@
 {
   "name": "@servoy/kiro-usage-panel",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "license": "MIT",
   "description": "OpenChamber panel showing AWS Kiro credit usage for the opencode-kiro-auth plugin",
