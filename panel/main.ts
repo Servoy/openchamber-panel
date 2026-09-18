@@ -10,7 +10,19 @@ import {
   mountSeparator
 } from '@openchamber/sdk/ui'
 
-const USAGE_FILE = '~/.config/opencode/kiro-usage.json'
+/**
+ * Where the plugin may have written kiro-usage.json, tried in order.
+ *
+ * The plugin writes to OpenCode's own config dir, which differs per OS:
+ * `~/.config/opencode` on macOS/Linux, `%APPDATA%\opencode` on Windows. The
+ * panel cannot read env vars, so it probes both defaults and uses the first
+ * that exists. Each must also be a declared `contributes.filesystem` pattern
+ * in package.json, or readFile is refused before it reaches disk.
+ */
+const USAGE_FILES = [
+  '~/.config/opencode/kiro-usage.json',
+  '~/AppData/Roaming/opencode/kiro-usage.json'
+]
 const POLL_MS = 15_000
 
 /** One account, as the plugin's kiro-usage.json writes it. */
@@ -344,12 +356,41 @@ async function renderMissingFile(now: number): Promise<void> {
 }
 
 let lastFileKey = ''
+// The candidate path that last held the snapshot, tried first next time so a
+// steady state does not re-probe both locations on every poll.
+let resolvedUsageFile: string | null = null
+
+/**
+ * Read the snapshot from the first candidate path that exists.
+ *
+ * Returns the parsed file, or throws the last error so the caller renders the
+ * missing/error state. A NOT_FOUND on one candidate is not fatal — the next is
+ * tried — but any other error (e.g. a permission or parse failure) surfaces.
+ */
+async function readUsageFile(): Promise<UsageFile> {
+  const order = resolvedUsageFile
+    ? [resolvedUsageFile, ...USAGE_FILES.filter((p) => p !== resolvedUsageFile)]
+    : USAGE_FILES
+  let lastError: unknown
+  for (const path of order) {
+    try {
+      const { content } = await host.readFile(path)
+      resolvedUsageFile = path
+      return JSON.parse(content) as UsageFile
+    } catch (error) {
+      lastError = error
+      if (error instanceof HostRequestError && error.code === 'NOT_FOUND') continue
+      throw error
+    }
+  }
+  resolvedUsageFile = null
+  throw lastError
+}
 
 async function paint(force = false): Promise<void> {
   let file: UsageFile
   try {
-    const { content } = await host.readFile(USAGE_FILE)
-    file = JSON.parse(content) as UsageFile
+    file = await readUsageFile()
   } catch (error) {
     clear()
     if (error instanceof HostRequestError && error.code === 'NOT_FOUND') {

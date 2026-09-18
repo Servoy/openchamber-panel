@@ -22,7 +22,10 @@
       },
       "page": true,
       "capabilities": ["sessions"],
-      "filesystem": ["~/.config/opencode/kiro-usage.json"],
+      "filesystem": [
+        "~/.config/opencode/kiro-usage.json",
+        "~/AppData/Roaming/opencode/kiro-usage.json"
+      ],
       "integration": {
         "name": "npm registry",
         "description": "Checks the latest published opencode-kiro-auth version to flag an outdated install. Public registry; no token needed.",
