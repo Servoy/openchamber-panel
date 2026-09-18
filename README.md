@@ -72,6 +72,41 @@ panel shows a "waiting for the plugin" notice with an update command.
 The panel appears on the right rail and, because `page: true` is set, also
 full-screen from the **Extension pages** menu.
 
+## Troubleshooting
+
+### "Could not clone that repository" / `POST /api/guests: HTTP 400`
+
+Almost always a **local Git configuration problem on Windows**, not a problem
+with this repository or OpenChamber. The most common cause is a Git for Windows
+install whose system config forces an SSL backend the binary was not built with:
+
+```
+# system config (C:\Program Files\Git\etc\gitconfig) says:
+http.sslBackend=openssl
+# but the Git build only supports:
+fatal: Unsupported SSL backend 'openssl'. Supported SSL backends: schannel
+```
+
+Git then exits non-zero on every HTTPS clone, and OpenChamber surfaces that as
+`clone-failed → HTTP 400` with no further detail in its logs.
+
+Fix it once, per user, by overriding the backend to the Windows-native one:
+
+```powershell
+git config --global http.sslBackend schannel
+```
+
+Then add the extension again in Settings → Extensions.
+
+### It still won't clone
+
+- You pasted the **SSH** URL (`git@github.com:...`). Use the HTTPS URL above; the
+  repository is public and needs no key.
+- A previous failed attempt is still shown — **Remove** the extension card in
+  Settings → Extensions and add it again.
+- On a **remote** OpenChamber instance the clone runs on the server, so the Git
+  fix above must be applied there.
+
 ## Permissions
 
 - `filesystem` — reads only `~/.config/opencode/kiro-usage.json`.
