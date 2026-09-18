@@ -23,7 +23,10 @@ const USAGE_FILES = [
   '~/.config/opencode/kiro-usage.json',
   '~/AppData/Roaming/opencode/kiro-usage.json'
 ]
-const POLL_MS = 15_000
+const POLL_MS = 10_000
+// Beyond this the snapshot is treated as stale — the plugin syncs at most once a
+// minute and only after a request, so this flags "no fresh reading lately".
+const STALE_MS = 90_000
 
 /** One account, as the plugin's kiro-usage.json writes it. */
 interface AccountUsage {
@@ -177,7 +180,7 @@ const fmt = (n: number, digits = 2): string =>
 const fmtInt = (n: number): string => Math.round(n).toLocaleString('en-US')
 
 /** "13d 4h", "4h 20m", or "12m" from a millisecond span; empty when past. */
-const fmtSpan = (ms: number): string => {
+const fmtSpan = (ms: number, withSeconds = false): string => {
   if (ms <= 0) return 'now'
   const mins = Math.floor(ms / 60_000)
   const days = Math.floor(mins / 1440)
@@ -185,6 +188,9 @@ const fmtSpan = (ms: number): string => {
   const m = mins % 60
   if (days > 0) return `${days}d ${hours}h`
   if (hours > 0) return `${hours}h ${m}m`
+  // Below a minute, seconds keep the live "updated N ago" counter moving; the
+  // reset ETA (withSeconds off) stays at minute resolution.
+  if (m < 1 && withSeconds) return `${Math.floor(ms / 1000)}s`
   return `${m}m`
 }
 
@@ -283,44 +289,69 @@ function renderSessions(
   const sepHost = container.appendChild(el('div'))
   mounted.push(mountSeparator(sepHost, { label: 'Recent sessions (estimated)' }))
 
-  const listHost = container.appendChild(el('div'))
-  const items = sessions.slice(0, 12).map((s) => {
-    const isCurrent = currentSessionId != null && s.sessionId === currentSessionId
-    const title = s.title || s.directory?.split('/').pop() || s.sessionId.slice(0, 12)
-    // Only surface the split when more than one account actually served the
-    // session; a single-account session's totals already say everything.
-    const split =
-      s.accounts && s.accounts.length > 1
-        ? s.accounts
-            .map((a) => {
-              const who = emailById.get(a.accountId) ?? a.accountId.slice(0, 8)
-              return `${who}: ~${fmt(a.estCredits, 1)} cr · ${a.requests} req`
-            })
-            .join('   ')
-        : undefined
-    return {
-      id: s.sessionId,
-      title: isCurrent ? `${title}  ·  current` : title,
-      subtitle: split ? `${s.directory ? `${s.directory}  ·  ` : ''}${split}` : s.directory,
-      meta: `~${fmt(s.estCredits, 1)} cr · ${s.requests} req`,
-      badge: isCurrent ? { label: 'now', tone: 'primary' as const } : undefined
-    }
-  })
-  mounted.push(
-    mountList(listHost, {
-      items,
-      ariaLabel: 'Recent Kiro sessions',
-      onSelect: (id) => void host.openSession(id).catch(() => {})
-    })
-  )
+  const shown = sessions.slice(0, 12)
+  // Scale each session's bar against the busiest session, so the list reads as
+  // a quick "where did the credits go" at a glance.
+  const maxCredits = Math.max(...shown.map((s) => s.estCredits), 0.0001)
+
+  const listHost = container.appendChild(el('div', 'sessions'))
+  for (const s of shown) renderSessionRow(listHost, s, maxCredits, emailById)
 
   container.appendChild(
     el(
       'div',
-      'muted tiny',
+      'muted caption',
       'Credits per session are estimated: Kiro bills per request, not per token, and the account total is split across sessions by request share. A shared account mixes in other users.'
     )
   )
+}
+
+/** One session row: name, path, a credit-share bar, and the credit/req figures. */
+function renderSessionRow(
+  container: HTMLElement,
+  s: SessionUsage,
+  maxCredits: number,
+  emailById: Map<string, string>
+): void {
+  const isCurrent = currentSessionId != null && s.sessionId === currentSessionId
+  const name = s.title || s.directory?.split('/').pop() || s.sessionId.slice(0, 12)
+
+  const row = container.appendChild(el('button', `srow${isCurrent ? ' current' : ''}`))
+  row.setAttribute('type', 'button')
+  row.addEventListener('click', () => void host.openSession(s.sessionId).catch(() => {})) // open the chat
+
+  const top = row.appendChild(el('div', 'srow-top'))
+  const left = top.appendChild(el('div', 'srow-name'))
+  left.appendChild(el('span', 'srow-title', name))
+  if (isCurrent) {
+    const b = left.appendChild(el('span', 'inline-badge'))
+    mounted.push(mountBadge(b, { label: 'now', tone: 'primary' }))
+  }
+  const figures = top.appendChild(el('div', 'srow-figures'))
+  figures.appendChild(el('span', 'srow-credits', `~${fmt(s.estCredits, 1)}`))
+  figures.appendChild(el('span', 'srow-unit', 'cr'))
+  figures.appendChild(el('span', 'srow-req', `${s.requests} req`))
+
+  // Bar showing this session's share of the busiest one.
+  const barWrap = row.appendChild(el('div', 'srow-bar'))
+  const fill = barWrap.appendChild(el('div', 'srow-bar-fill'))
+  fill.style.width = `${Math.max(2, Math.round((s.estCredits / maxCredits) * 100))}%`
+
+  // The directory only when it adds something beyond the title.
+  if (s.directory && s.directory.split('/').pop() !== name) {
+    row.appendChild(el('div', 'srow-path muted', s.directory))
+  }
+
+  // Per-account split, only when more than one account served the session.
+  if (s.accounts && s.accounts.length > 1) {
+    const split = s.accounts
+      .map((a) => {
+        const who = emailById.get(a.accountId) ?? a.accountId.slice(0, 8)
+        return `${who}: ~${fmt(a.estCredits, 1)} cr · ${a.requests} req`
+      })
+      .join('   ·   ')
+    row.appendChild(el('div', 'srow-split muted', split))
+  }
 }
 
 /**
@@ -438,9 +469,27 @@ async function paint(force = false): Promise<void> {
   renderVersion(wrap, file.pluginVersion, file.pluginInstances ?? [])
 
   const footer = wrap.appendChild(el('div', 'footer'))
-  footer.appendChild(
-    el('span', 'muted tiny', `Updated ${fmtSpan(now - (file.writtenAt || now))} ago`)
-  )
+  const updated = footer.appendChild(el('div', 'updated'))
+  const label = updated.appendChild(el('span', 'muted tiny'))
+  const staleBadgeHost = updated.appendChild(el('span', 'inline-badge'))
+
+  // Tick the "updated Ns ago" label every second so it feels live between the
+  // 10s polls, and flip to a "cached" badge once the reading goes stale.
+  const writtenAt = file.writtenAt || now
+  let staleShown = false
+  const tick = () => {
+    const age = Date.now() - writtenAt
+    label.textContent = `Updated ${fmtSpan(age, true)} ago`
+    const stale = age > STALE_MS
+    if (stale && !staleShown) {
+      staleShown = true
+      mounted.push(mountBadge(staleBadgeHost, { label: 'cached', tone: 'warning' }))
+    }
+  }
+  tick()
+  const ticker = setInterval(tick, 1_000)
+  mounted.push({ dispose: () => clearInterval(ticker) })
+
   const btnHost = footer.appendChild(el('div'))
   mounted.push(
     mountButton(btnHost, {
@@ -545,24 +594,45 @@ function shortenPath(source: string | undefined): string | undefined {
 
 function injectStyles(): void {
   const style = document.createElement('style')
+  // Sizes are in em so everything scales with the host font-size (OpenChamber
+  // sets 0.875rem + line-height 1.45 on the root via applyHostReady); colours
+  // use the host's own tokens (--oc-fg/--oc-muted/--oc-border/--oc-hover/
+  // --oc-primary) so the panel matches the app's theme, light or dark.
   style.textContent = `
-    .wrap { display: flex; flex-direction: column; gap: 14px; }
-    .card { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: var(--oc-radius, 8px); background: var(--oc-surface-1, rgba(127,127,127,0.06)); }
+    .wrap { display: flex; flex-direction: column; gap: 1.15em; }
+    .card { display: flex; flex-direction: column; gap: 0.85em; padding: 1em; border-radius: var(--oc-radius, 0.5em); background: var(--oc-elevated, rgba(127,127,127,0.06)); border: 1px solid var(--oc-border, transparent); }
     .row { display: flex; align-items: center; }
-    .head { justify-content: space-between; gap: 8px; }
-    .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-    .email { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .head > div { display: flex; gap: 6px; align-items: center; }
-    .bar { margin: 2px 0; }
-    .stats { display: grid; grid-template-columns: 1fr; gap: 4px; }
-    .stat { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
-    .stat-label { color: var(--oc-text-muted, #888); }
-    .stat-value { font-variant-numeric: tabular-nums; text-align: right; display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
-    .muted { color: var(--oc-text-muted, #888); }
-    .small { font-size: 11px; }
-    .tiny { font-size: 10px; line-height: 1.4; }
-    .footer { display: flex; align-items: center; justify-content: space-between; margin-top: 2px; }
+    .head { justify-content: space-between; gap: 0.6em; }
+    .who { display: flex; flex-direction: column; gap: 0.2em; min-width: 0; }
+    .email { font-weight: 600; font-size: 1.05em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .head > div { display: flex; gap: 0.4em; align-items: center; }
+    .bar { margin: 0.15em 0; }
+    .stats { display: grid; grid-template-columns: 1fr; gap: 0.4em; }
+    .stat { display: flex; justify-content: space-between; gap: 0.85em; }
+    .stat-label { color: var(--oc-muted, #888); }
+    .stat-value { font-variant-numeric: tabular-nums; text-align: right; display: flex; align-items: center; gap: 0.4em; justify-content: flex-end; }
+    .muted { color: var(--oc-muted, #888); }
+    .small { font-size: 0.9em; }
+    .tiny { font-size: 0.85em; line-height: 1.4; }
+    .caption { font-size: 0.9em; line-height: 1.55; margin-top: 0.4em; }
+    .footer { display: flex; align-items: center; justify-content: space-between; margin-top: 0.15em; }
+    .updated { display: flex; align-items: center; gap: 0.4em; }
     .inline-badge { display: inline-flex; }
+    .sessions { display: flex; flex-direction: column; gap: 0.25em; }
+    .srow { display: flex; flex-direction: column; gap: 0.4em; width: 100%; text-align: left; padding: 0.65em 0.75em; border: 0; border-radius: var(--oc-radius, 0.5em); background: transparent; color: inherit; font: inherit; cursor: pointer; transition: background 0.12s ease; }
+    .srow:hover { background: var(--oc-hover, rgba(127,127,127,0.10)); }
+    .srow.current { background: color-mix(in srgb, var(--oc-primary, #6b8afd) 12%, transparent); }
+    .srow-top { display: flex; align-items: baseline; justify-content: space-between; gap: 0.7em; }
+    .srow-name { display: flex; align-items: center; gap: 0.4em; min-width: 0; }
+    .srow-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .srow-figures { display: flex; align-items: baseline; gap: 0.3em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .srow-credits { font-weight: 600; }
+    .srow-unit { font-size: 0.85em; color: var(--oc-muted, #888); }
+    .srow-req { font-size: 0.85em; color: var(--oc-muted, #888); margin-left: 0.3em; }
+    .srow-bar { height: 0.3em; border-radius: 0.15em; background: var(--oc-muted-surface, rgba(127,127,127,0.14)); overflow: hidden; }
+    .srow-bar-fill { height: 100%; border-radius: 0.15em; background: var(--oc-primary, #6b8afd); }
+    .srow-path { font-size: 0.85em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .srow-split { font-size: 0.85em; }
   `
   document.head.appendChild(style)
 }

@@ -55,6 +55,13 @@ In OpenChamber: **Settings → Extensions**, paste the repository URL into the
 **Folder, ZIP, or URL** field, choose **Add**, and approve the requested
 permissions.
 
+Use the **HTTPS** URL (the repository is public, so no SSH key or Git identity
+is needed):
+
+```
+https://github.com/Servoy/openchamber-panel.git
+```
+
 Add `#v1.0.0` to the URL to pin a tag. A Git-URL install updates itself: choose
 **Update** in Settings → Extensions once a newer version is published.
 
