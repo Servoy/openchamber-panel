@@ -3,25 +3,20 @@
 A right-rail OpenChamber panel that shows AWS Kiro credit usage, read from the
 snapshot written by the `@servoy/opencode-kiro-auth` OpenCode plugin.
 
-```
-you@example.com                (eu-central-1)   [KIRO POWER]
-[##########                    ] 41% · 4,061.45 / 10,000
-Remaining            5,938.55 credits
-Resets               1 October 2026 (13d)
-Until reset          13d 4h
-Overage              $0.04/credit (disabled), cap 10,000
-Used (this window)   +12.30 credits
-Rate                 4.1 credits/h
-At this rate, empty in   13d 2h
-```
+The account card shows a usage ring, credits left, your recent daily burn, and
+whether you will make it to the reset — with a collapsible Details section for
+plan, reset date and overage, an account pager when more than one Kiro account is
+signed in, a scrollable recent-sessions list, and a plugin-version footer.
 
 ## How it works
 
 The panel cannot reach AWS or read a bearer token — the OpenChamber sandbox
 forbids both. Instead the plugin writes an account-usage snapshot to
-`~/.config/opencode/kiro-usage.json` after every usage sync, and the panel reads
-that file through the host's `readFile` (a declared `filesystem` permission for
-that one path).
+`~/.config/opencode/kiro-usage.json` (at startup and after every usage sync), and
+the panel reads that file through the host's `readFile` (a declared `filesystem`
+permission for that one path). Because the plugin seeds the file at startup, the
+panel shows data — possibly slightly stale — immediately, without waiting for the
+first message.
 
 The snapshot carries the plan name, credits used/limit, overage rate/cap/status,
 and the reset date. Every OpenCode project runs its own plugin instance against
@@ -29,11 +24,17 @@ the shared config directory, so the write is atomic (temp file + rename):
 last-writer-wins is correct for a shared account total, and a reader never sees a
 half-written file.
 
-### Live burn
+### Daily burn and reset outlook
 
-The panel remembers the first credit reading it sees per account and derives
-"used this window", a credits/hour rate, and a rough ETA to the limit. This is
-account-wide, not per-session.
+The panel sums the estimated credits of sessions active in the last 7 days and
+divides by the time actually measured (never less than a day, so a single busy
+hour is not read as a huge rate), giving an "≈ X cr/day" figure that settles into
+a true weekly average as history accumulates. It projects that daily rate over
+the days left until the reset and shows the useful answer: how many credits you
+will have to spare at the reset, or how many short and the day you would run out.
+The rate needs one message before it can exist; until then the card shows the
+reset countdown. Colours warn at 85% used and turn critical at 95% or under ~200
+credits left. All of it is theme-aware (OpenChamber's own colour tokens).
 
 ### Sessions (estimated)
 
@@ -62,8 +63,12 @@ is needed):
 https://github.com/Servoy/openchamber-panel.git
 ```
 
-Add `#v1.0.0` to the URL to pin a tag. A Git-URL install updates itself: choose
+Add `#v1.1.0` to the URL to pin a tag. A Git-URL install updates itself: choose
 **Update** in Settings → Extensions once a newer version is published.
+
+For a **folder install** (running from a local checkout), OpenChamber caches the
+panel's iframe assets; after a rebuild, **Remove** the extension card and add the
+folder again to be sure the new bundle loads.
 
 The panel needs `@servoy/opencode-kiro-auth` **v2.2.0 or newer** active in
 OpenCode, since that is the version that writes `kiro-usage.json`. Until then the

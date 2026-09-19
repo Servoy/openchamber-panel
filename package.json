@@ -1,11 +1,11 @@
 {
   "name": "@servoy/kiro-usage-panel",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "license": "MIT",
   "description": "OpenChamber panel showing AWS Kiro credit usage for the opencode-kiro-auth plugin",
   "scripts": {
-    "build": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
+    "build": "bun scripts/build.ts",
     "typecheck": "tsc --noEmit"
   },
   "openchamber": {

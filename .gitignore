@@ -1,3 +1,9 @@
 node_modules/
 *.tmp
 .DS_Store
+
+# Local development only — not part of the extension distribution
+host-sim.html
+persist-test.mjs
+*.test.mjs
+.openchamber/

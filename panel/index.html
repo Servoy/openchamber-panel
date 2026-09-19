@@ -13,12 +13,16 @@
         height: 100%;
         padding: 12px;
         box-sizing: border-box;
-        overflow-y: auto;
+        overflow: hidden;
       }
     </style>
   </head>
   <body>
     <div id="root"></div>
-    <script src="main.js"></script>
+    <!-- Load main.js with a cache-busting query. OpenChamber's iframe caches
+         the script by URL and an app restart does not clear that HTTP cache, so
+         a plain src kept serving an old bundle. Bump ?v= on every build (the
+         build script rewrites it) so a new bundle is always a new URL. -->
+    <script src="main.js?v=mu8eu6na"></script>
   </body>
 </html>
