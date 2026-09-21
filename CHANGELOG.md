@@ -4,6 +4,17 @@ All notable changes to this panel are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1]
+
+### Fixed
+
+- **Subagent sessions now show their real name.** Titles were learned only from
+  the active session (`onSession`), so subagents — which never become active —
+  all fell back to their directory name (e.g. every row read "svyCloud"), and a
+  title only appeared while a row was clicked. The panel now subscribes to
+  `onSessions` for every project and learns each session's title there, so all
+  rows (subagents included) keep their real name across navigation and reloads.
+
 ## [1.1.0]
 
 ### Added

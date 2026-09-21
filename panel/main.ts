@@ -1070,12 +1070,37 @@ function injectStyles(): void {
 
 // ── host wiring ───────────────────────────────────────────────────────────────
 
-async function trackCurrentProject(): Promise<void> {
+/**
+ * Subscribe to every project's sessions and learn their titles.
+ *
+ * The session rows come from the plugin snapshot, which does not carry a title,
+ * so a row fell back to its directory basename (every subagent showed up as the
+ * folder name, e.g. "svyCloud"). `onSession` only ever reports the *active*
+ * session's title — a subagent never becomes active, so clicking a row was the
+ * only way its name appeared, and it was lost again on navigation.
+ *
+ * `host.onSessions(projectId)` instead lists ALL sessions with their id + title.
+ * Feeding those into the persistent title cache gives every row — subagents
+ * included — its real name, kept across reloads. All projects are tracked so a
+ * session belonging to another project still resolves.
+ */
+async function trackSessionTitles(): Promise<void> {
   try {
     const projects = await host.listProjects()
-    const projectId = projects.projects[0]?.id
-    if (!projectId) return
-    await host.onSessions(projectId, () => void paint(true))
+    for (const project of projects.projects) {
+      await host.onSessions(project.id, (snapshot) => {
+        let learned = false
+        for (const s of snapshot.sessions) {
+          if (s.title && s.title !== s.id) {
+            const before = sessionTitleCache.get(s.id)?.title
+            rememberSessionTitle(s.id, s.title, s.updatedAt || Date.now())
+            if (before !== s.title) learned = true
+          }
+        }
+        // Repaint when a title changed so rows update without a click.
+        void paint(learned)
+      })
+    }
   } catch {
     // sessions capability not granted or nothing open — degrade silently.
   }
@@ -1089,7 +1114,7 @@ host.onReady((ctx) => {
   injectStyles()
   void loadUiState()
   void paint(true)
-  void trackCurrentProject()
+  void trackSessionTitles()
   setInterval(() => void paint(), POLL_MS)
 })
 
