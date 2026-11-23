@@ -4,6 +4,86 @@ All notable changes to this panel are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0]
+
+### Changed
+
+- **Tokens are estimates, not exact.** Kiro sends no token counts; the plugin estimates output (~4 characters per token) and derives input from Kiro's context percentage. Labelled `est. · plugin`, shown with `~`. Cache read/write are hidden (always 0).
+- **No more "exact" tags.** An unlabelled number is exact; only estimates carry `est.` or `~`. The scope ("this account") appears only when it changes the meaning.
+- **Pace per working day** (Monday to Friday, 40-hour week). Order: Kiro's own counter (`counterDelta`, once it spans 3 days), then the exact month average. A partial `burn[].credits` is never read as a pace.
+- **Credits per request** uses only sessions begun since the metering switch, and needs 50 requests.
+- **Requests · 7d** is `burn[].requests`, exact per account over the whole window.
+- **Pre-metering sessions** (begun before `meteredSince`) are dimmed with a note above the list and never marked "priciest".
+- Key figures are two tiles (Requests, Credits / request); tool calls live in Tool usage and in a session's Tools header.
+- `execute` carries a note: a Code Mode script is one call, the calls inside it are not counted.
+- The last known `resetAt` per account is remembered, also across reloads, so a snapshot without it does not drop the projection.
+
+### Removed
+
+- Closest to compaction tile, Context window and Cost rank in the drill-down, "Most-used tool per session", per-row tool and context figures in the session list. OpenCode already shows context, and the rest repeated other sections.
+- Duplicate wording: "all accounts" on tool calls and tokens, the token total in the heading, "not classified" and "no cost per tool" notes.
+
+### Added
+
+- Snapshot fields `creditsSource`, `meteredSince`, `burn[].creditsSince`, `counterDelta`, `counterSince` (see `panel/schema.ts`, CONTRACT v3).
+- Tool lists in the session drill-down show 8 with "Show all".
+
+## [1.3.0]
+
+### Contract with the plugin (final)
+
+- Tool calls and turn mix come from **OpenCode** (exact, summed over a session and its subagents, Kiro provider only); tokens are estimated by the plugin (corrected in 1.4.0); credits from **Kiro** (estimated). Each block is labelled with its source.
+- `turns` is `{toolUse, answer, error}`; a failed turn shows in the session row and the drill-down.
+- Context window is read **live from OpenChamber**, not from the file.
+- Tokens are a single top-level total for all accounts (a message has no account id). Window labels come from `windowDays`.
+- Removed from the contract: `contextPct`, `withReasoning`, `burn[].tokens`, `burn[].toolCalls`, `metered`, per-field `source`.
+- The panel reads every candidate `kiro-usage.json` (`~/.config`, `%APPDATA%`, `~/.servoy`) and uses the newest.
+- A removed account's share of a session stays visible (muted, "removed"); the session bar is split per account.
+
+### Changed
+
+- **Schema aligned with what the plugin can really fill.** `schema.ts` now labels every field EXACT/EST. and TODAY/SMALL/NEW, verified against `@servoy/opencode-kiro-auth` 2.10.0.
+- **Tokens** (labelled exact here, corrected in 1.4.0): a Tokens section (session and 7-day) with input, cache read, cache write and output, cache reads shown on their own, and "from N of M requests" when Kiro did not report all of them.
+- Added optional `sessions[].metered` (Kiro's own `meteringEvent` credits) and shown only when present.
+
+### Removed
+
+- Credits per tool, model, agent, `periodStartAt`, `estTokens` and `usedEnd`: the plugin has no realistic source for them. Tools are ranked by exact call count.
+- "Needs plugin 2.3.0" copy (that version number was invented); missing sections now say what the plugin does not record yet.
+
+## [1.2.0]
+
+### Added
+
+- **Insights.** Credits-per-day trend (7d/14d bars with average line and
+  week-over-week change), tool usage (exact counts per tool, priciest tool calls
+  per session), key figures (requests, tool calls, credits/request, fullest
+  context), per-account overview, sortable sessions (cost, recent, requests,
+  context) with a "priciest" marker.
+- **Session drill-down.** Click a session (or a tool hit) for credits, requests,
+  tool breakdown, context window, model/agent and which accounts served it.
+  Esc or "All sessions" goes back.
+- **Projections.** "Day N of M" with a credits-vs-time bar, and a plain verdict:
+  lasts to the reset (credits to spare) or runs out in ~N days. Falls back to the
+  period average (exact `used` ÷ days elapsed) when there is no recent burn.
+- **Full-screen layout.** Two columns when the panel is wide, single column in the
+  rail; sizing follows the container, not the window.
+- **Account chips** replace the pager when several accounts are signed in.
+- Stale-snapshot notice, and "not reported" in place of every missing value.
+
+### Changed
+
+- Every estimate is tagged `est.` / `~`; exact values are tagged `exact`.
+  A missing field is shown as "not reported", never 0.
+- Colours use only OpenChamber `--oc-*` tokens (no hex fallbacks).
+- Source split into `schema.ts` (snapshot contract), `insights.ts` (pure logic),
+  `ui.ts`, `styles.ts` and `main.ts`.
+
+### Plugin contract
+
+New optional snapshot fields (schema 2) are documented in `panel/schema.ts` and the
+README. Older plugins keep working; the insight sections then say what is missing.
+
 ## [1.1.1]
 
 ### Fixed

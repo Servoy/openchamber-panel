@@ -1,6 +1,6 @@
 {
   "name": "@servoy/kiro-usage-panel",
-  "version": "1.1.1",
+  "version": "1.4.0",
   "private": true,
   "license": "MIT",
   "description": "OpenChamber panel showing AWS Kiro credit usage for the opencode-kiro-auth plugin",
@@ -21,23 +21,18 @@
         "entry": "panel/index.html"
       },
       "page": true,
-      "capabilities": ["sessions"],
+      "capabilities": [
+        "sessions"
+      ],
       "filesystem": [
         "~/.config/opencode/kiro-usage.json",
-        "~/AppData/Roaming/opencode/kiro-usage.json"
-      ],
-      "integration": {
-        "name": "npm registry",
-        "description": "Checks the latest published opencode-kiro-auth version to flag an outdated install. Public registry; no token needed.",
-        "token": {
-          "apiOrigin": "https://registry.npmjs.org",
-          "scheme": "bearer"
-        }
-      }
+        "~/AppData/Roaming/opencode/kiro-usage.json",
+        "~/.servoy/opencode/kiro-usage.json"
+      ]
     }
   },
   "dependencies": {
-    "@openchamber/sdk": "^1.24.1"
+    "@openchamber/sdk": "2.7.2"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

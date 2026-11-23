@@ -3,10 +3,73 @@
 A right-rail OpenChamber panel that shows AWS Kiro credit usage, read from the
 snapshot written by the `@servoy/opencode-kiro-auth` OpenCode plugin.
 
-The account card shows a usage ring, credits left, your recent daily burn, and
-whether you will make it to the reset — with a collapsible Details section for
-plan, reset date and overage, an account pager when more than one Kiro account is
-signed in, a scrollable recent-sessions list, and a plugin-version footer.
+The panel shows, per account: a usage ring, credits left, recent daily burn, "day
+N of M" against credits used, and a verdict on whether you will make it to the
+reset. Below that: key figures (requests, credits/request), tokens, tool usage, a
+sortable session list and a per-session drill-down. It works in the narrow rail
+and full-screen (two columns when wide), in light and dark.
+
+## Exact, estimated, not reported
+
+Kiro bills **per request, not per token**, and reports no cost per request, no
+token counts and no cost per tool call. Credits exist only as an account total.
+So every number is one of:
+
+| Kind | Examples | Shown as |
+| --- | --- | --- |
+| Exact | requests, tool calls, turns, account credits/limit/reset, Kiro's own credit counter, the month average | plain, no tag |
+| Estimated | tokens (by the plugin), credits per session, projections | `~` prefix and `est.` tag |
+| Missing | any field the plugin did not write | `not reported` (never 0) |
+
+An unlabelled number is exact. Tokens are **estimated by the plugin**: Kiro sends
+none. Output is about 4 characters per token; input is Kiro's context percentage
+times the model window the plugin assumes. They show where the budget went but do
+not convert to credits. A Code Mode `execute` call counts as one tool call; the
+calls inside the script are not recorded separately.
+
+Sessions begun before the plugin metered credits per response (`meteredSince`)
+carry overcounted credits. The panel dims them, marks them "pre-metering", and
+never calls them "priciest".
+
+## Snapshot schema (what the plugin writes)
+
+The authoritative, commented contract is the header of [`panel/schema.ts`](panel/schema.ts)
+("CONTRACT v2"), agreed between the panel and the plugin. Two sources feed the panel and every
+number carries its source:
+
+- **Kiro** (only the plugin knows it): credits, quota, overage, reset, requests, the credit counter,
+  the per-session credits.
+- **OpenCode** (the plugin reads it from OpenCode's own per-message data and copies a bounded
+  aggregate into the file): tool calls, how each response ended, and the token estimates.
+
+The file stays small by design (about 55 KB, however heavy the use): the top 50 sessions plus fixed-size aggregates.
+
+| Field | Trust | Notes |
+| --- | --- | --- |
+| `accounts[]` (used, limit, pct, plan, overage, resetAt, …) | exact | Kiro |
+| `sessions[]` top 50: `requests`, `firstUsed`, `lastUsed`, `directory`, `accounts[]` | exact | Kiro |
+| `creditsSource: 'metered'`, `meteredSince` | exact | credits are booked per response from `meteredSince` on; absent on older plugins |
+| `sessions[].estCredits` | metered, or estimate when `creditsSource` is absent | sessions begun before `meteredSince` are overcounted |
+| `burn[]` per account: `windowDays`, `requests`, `earliestUsed` | exact | `requests` covers every session active in the window |
+| `burn[].credits`, `creditsSince` | measured, a lower bound | only sessions begun after `meteredSince`; not a pace until a full window is metered |
+| `burn[].counterDelta`, `counterSince` | exact | rise of Kiro's own `used` counter over the window; the pace once it spans 3 days |
+| `sessions[].tokens` {uncachedInputTokens, outputTokens, …} | estimate | by the plugin, summed over the root session and its subagents, Kiro provider only |
+| `sessions[].tools[]` {name, count}, `toolCalls` | exact | same scope |
+| `sessions[].turns` {toolUse, answer, error} | exact | from each response's finish reason; a running response is not counted |
+| `tokens` {…, windowDays} | estimate | all accounts together |
+| `tools` {windowDays, totalCalls, items[]} | exact | all accounts together |
+| `daily[]` | optional | the panel hides "Credits per day" when it is absent |
+| `sessionsTotal`, `schema: 2` | exact | |
+
+The panel detects what a plugin delivers from these fields, never from its version number.
+
+Not in the file: **context %** (OpenCode shows it itself, so the panel does not), credits per tool,
+model. Kiro reports no cache split, so cache read/write are hidden. Window labels ("7d") come from
+`windowDays`, never hardcoded. Input tokens are the whole prompt of every request: they count tokens
+processed, not tokens billed, and credits do not follow tokens (correlation 0.36 over 1,012 responses),
+so the panel never converts one to the other.
+
+Subagent sessions are booked under their root session, so a root's tokens and tools include its children.
 
 ## How it works
 
@@ -24,25 +87,23 @@ the shared config directory, so the write is atomic (temp file + rename):
 last-writer-wins is correct for a shared account total, and a reader never sees a
 half-written file.
 
-### Daily burn and reset outlook
+### Pace and reset outlook
 
-The panel sums the estimated credits of sessions active in the last 7 days and
-divides by the time actually measured (never less than a day, so a single busy
-hour is not read as a huge rate), giving an "≈ X cr/day" figure that settles into
-a true weekly average as history accumulates. It projects that daily rate over
-the days left until the reset and shows the useful answer: how many credits you
-will have to spare at the reset, or how many short and the day you would run out.
-The rate needs one message before it can exist; until then the card shows the
-reset countdown. Colours warn at 85% used and turn critical at 95% or under ~200
-credits left. All of it is theme-aware (OpenChamber's own colour tokens).
+Credits left and the reset date are exact and give a **budget per working day**.
+Pace is counted per working day (Monday to Friday, a 40-hour week; weekends count
+zero) and judged two ways: this month's average (credits used ÷ working days so
+far, exact) and the last 7 days, from Kiro's own counter once it has been recorded
+for 3 days. The period start is assumed to be one month before the reset. The card
+says "lasts to the reset" (green) when both fit, "could run out" (amber) when they
+disagree, and "runs out" when neither does. A pace measured over less than a full
+window is never used: right after the metering switch it would say "plenty left".
 
-### Sessions (estimated)
+### Sessions
 
-Kiro bills per request (invocation), not per token, and its token counts are
-unreliable — so there is no exact per-session cost. The plugin counts requests
-per OpenCode session and apportions each account credit delta across the sessions
-active in that window, by request share. The panel labels this as an estimate. On
-a shared account, other users' usage mixes into the total.
+Kiro reports credits only as an account total, so the plugin assigns credits to
+sessions. Since `meteredSince` it meters them per response; older sessions were
+apportioned by request share and run high, which the panel marks as "pre-metering".
+On a shared account, other users' usage mixes into the total.
 
 ### Plugin instances
 
@@ -63,16 +124,17 @@ is needed):
 https://github.com/Servoy/openchamber-panel.git
 ```
 
-Add `#v1.1.0` to the URL to pin a tag. A Git-URL install updates itself: choose
+Add `#v1.4.0` to the URL to pin a tag. A Git-URL install updates itself: choose
 **Update** in Settings → Extensions once a newer version is published.
 
 For a **folder install** (running from a local checkout), OpenChamber caches the
 panel's iframe assets; after a rebuild, **Remove** the extension card and add the
 folder again to be sure the new bundle loads.
 
-The panel needs `@servoy/opencode-kiro-auth` **v2.2.0 or newer** active in
-OpenCode, since that is the version that writes `kiro-usage.json`. Until then the
-panel shows a "waiting for the plugin" notice with an update command.
+The panel needs `@servoy/opencode-kiro-auth` **v2.11.0 or newer** active in
+OpenCode: that is the version that meters credits per response and writes the fields
+the panel relies on (`creditsSource`, `meteredSince`, `counterDelta`). Without a
+snapshot the panel shows a "waiting for the plugin" notice with an update command.
 
 The panel appears on the right rail and, because `page: true` is set, also
 full-screen from the **Extension pages** menu.
@@ -114,10 +176,12 @@ Then add the extension again in Settings → Extensions.
 
 ## Permissions
 
-- `filesystem` — reads only `~/.config/opencode/kiro-usage.json`.
+- `filesystem` — reads only `kiro-usage.json` (in `~/.config/opencode`, `%APPDATA%\opencode`
+  or `~/.servoy/opencode`).
 - `sessions` — lists project sessions to highlight the active chat.
-- `network` — checks the npm registry for the latest plugin version (public;
-  no token needed).
+
+The latest plugin version is delivered by the plugin in the snapshot, so the panel
+needs no network access.
 
 The Kiro token stays in the plugin and is never exposed to the panel.
 

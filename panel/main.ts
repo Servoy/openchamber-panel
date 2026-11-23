@@ -1,5 +1,70 @@
+/**
+ * Kiro Usage panel.
+ *
+ * Data contract: the panel reads ONLY `kiro-usage.json`, written by the
+ * @servoy/opencode-kiro-auth plugin. The exact schema (field names, types, and
+ * which values are exact vs estimated) is documented in ./schema.ts and in the
+ * README. Rules this file follows everywhere:
+ *
+ *  - Estimates are shown with "~" and an "est." tag, never as hard numbers.
+ *  - A missing value is "not reported", never 0.
+ *  - Colours come only from OpenChamber's `--oc-*` tokens.
+ */
 import { connectHost, HostRequestError } from '@openchamber/sdk'
 import { applyHostReady, mountBanner, mountEmpty } from '@openchamber/sdk/ui'
+import type { AccountUsage, PluginInstance, SessionUsage, TokenCounts, UsageFile } from './schema'
+import {
+  aggregateTools,
+  recentBurn,
+  creditsPerRequest,
+  isPreMetering,
+  hasInsightFields,
+  dailySeries,
+  DAY_MS,
+  projectionFor,
+  type PaceView,
+  promptTokens,
+  requests7d,
+  sortSessions,
+  toolCallsOf,
+  tokenSummary,
+  accountsInUse,
+  turnSplit,
+  trendStats,
+  type Burn,
+  type Projection,
+  type SessionSort
+} from './insights'
+import {
+  barChart,
+  el,
+  estCr,
+  fmt,
+  fmtAgo,
+  fmtApproxDate,
+  fmtCompact,
+  fmtDay,
+  fmtDuration,
+  fmtInt,
+  fmtShortDate,
+  fmtSpan,
+  hbar,
+  segBar,
+  ICON_ALERT,
+  ICON_ARROW_LEFT,
+  ICON_BOLT,
+  ICON_CHEVRON_DOWN,
+  ICON_CLOCK,
+  icon,
+  infoIcon,
+  notReported,
+  ring,
+  toneFor,
+  toneText,
+  toneVar,
+  type Tone
+} from './ui'
+import { STYLES } from './styles'
 
 /**
  * Where the plugin may have written kiro-usage.json, tried in order.
@@ -12,77 +77,22 @@ import { applyHostReady, mountBanner, mountEmpty } from '@openchamber/sdk/ui'
  */
 const USAGE_FILES = [
   '~/.config/opencode/kiro-usage.json',
-  '~/AppData/Roaming/opencode/kiro-usage.json'
+  '~/AppData/Roaming/opencode/kiro-usage.json',
+  // Servoy launches OpenCode with XDG_CONFIG_HOME=~/.servoy on every OS, and the
+  // plugin follows XDG_CONFIG_HOME, so its state then lives here instead.
+  '~/.servoy/opencode/kiro-usage.json'
 ]
 const POLL_MS = 10_000
 // Beyond this the snapshot is treated as stale — the plugin syncs at most once a
 // minute and only after a request, so this flags "no fresh reading lately".
 const STALE_MS = 90_000
-
-/** One account, as the plugin's kiro-usage.json writes it. */
-interface AccountUsage {
-  id: string
-  email: string
-  region: string
-  used: number
-  limit: number
-  pct: number
-  plan?: string
-  planType?: string
-  overageStatus?: string
-  overageRate?: number
-  overageCap?: number
-  currentOverages?: number
-  unit?: string
-  resetAt?: number
-  daysUntilReset?: number
-  isHealthy: boolean
-  updatedAt: number
-}
-
-/** One account's contribution to a session, as the plugin writes it. */
-interface SessionAccountUsage {
-  accountId: string
-  requests: number
-  estCredits: number
-  firstUsed: number
-  lastUsed: number
-}
-
-interface SessionUsage {
-  sessionId: string
-  title?: string
-  directory?: string
-  requests: number
-  estCredits: number
-  firstUsed: number
-  lastUsed: number
-  /** Per-account split behind the totals; present when a session spans accounts. */
-  accounts?: SessionAccountUsage[]
-}
-
-interface PluginInstance {
-  pid: number
-  version: string
-  source?: string
-  self: boolean
-  lastSeen: number
-}
-
-interface UsageFile {
-  version: 1
-  writtenAt: number
-  pluginVersion?: string
-  pluginInstances?: PluginInstance[]
-  accounts: AccountUsage[]
-  sessions: SessionUsage[]
-}
+// Beyond this the "stale" notice escalates from neutral to a warning.
+const VERY_STALE_MS = 6 * 60 * 60 * 1000
 
 /** The plugin version that first writes the usage snapshot. */
-const MIN_SUPPORTED_VERSION = '2.2.0'
+const MIN_SUPPORTED_VERSION = '2.11.0'
 
 const PLUGIN_PKG = '@servoy/opencode-kiro-auth'
-const VERSION_CHECK_MS = 60 * 60 * 1000
 
 const host = connectHost()
 const root = document.querySelector('#root') as HTMLElement
@@ -94,48 +104,71 @@ const clear = () => {
   root.innerHTML = ''
 }
 
+// ── UI state ──────────────────────────────────────────────────────────────────
+
 // The current OpenChamber session id, to highlight its row in the session list.
 let currentSessionId: string | null = null
-// Last known reset time per account, ms. A fresh snapshot can omit resetAt
-// (some getUsageLimits param combos drop it), which would make the ETA row
-// flicker away on a repaint; remembering it keeps the ETA stable.
-const lastResetAt = new Map<string, number>()
 // The active session's title from the host, used to name its row when the
-// plugin has not recorded a title yet (a brand-new session shows only its id).
+// plugin has not recorded a title yet.
 let currentSessionTitle: string | null = null
-// Which account the pager is showing; kept across repaints so a poll does not
-// reset the user back to the first account.
+// Last known reset time per account, ms. A fresh snapshot can omit resetAt, which
+// would make the projection flicker away on a repaint.
+const lastResetAt = new Map<string, number>()
+// Which account is shown; kept across repaints so a poll does not reset it.
 let accountIdx = 0
+// Drill-down: the session whose full breakdown is open, or null for the overview.
+let detailId: string | null = null
+// A view change (open/close drill-down) starts at the top; a poll repaint keeps
+// the scroll position so nothing jumps.
+let resetScrollNext = false
 
-// ── persisted UI state ────────────────────────────────────────────────────────
+type Range = 7 | 14
+let detailsOpen = false
+let sortMode: SessionSort = 'cost'
+let rangeDays: Range = 14
+let showAllTools = false
+// Drill-down: the session whose full tool list is expanded. Not persisted, and another session opens collapsed.
+let showAllSessionTools: string | null = null
 
-/**
- * Session titles seen via the host, persisted across reloads.
- *
- * The host only tells the panel the title of the *current* session
- * (`onSession`); a session drops out of that once you switch away, and a
- * plain in-memory `Map` forgets it again on the next reload or OpenChamber
- * restart. `host.storage` survives both — it is server-side, per-extension
- * storage, and needs no extra capability.
- */
 const SESSION_TITLES_KEY = 'session-titles'
+const DETAILS_OPEN_KEY = 'details-open'
+const PREFS_KEY = 'ui-prefs'
 /** Trim to this many entries on save, so the stored value stays well under
  * the 64 KiB-per-key limit regardless of how long the panel has run. */
 const SESSION_TITLES_MAX = 300
 const sessionTitleCache = new Map<string, { title: string; seenAt: number }>()
 let sessionTitlesLoaded = false
+// Not persisted: a long list is a deliberate, temporary expansion.
+let showAllSessions = false
 let saveTitlesTimer: ReturnType<typeof setTimeout> | undefined
 
-/** Whether the account "Details" section is expanded; persisted, default off. */
-const DETAILS_OPEN_KEY = 'details-open'
-let detailsOpen = false
+const SORTS: SessionSort[] = ['cost', 'recent', 'requests', 'tokens']
+
+const RESET_AT_KEY = 'last-reset-at'
+
+/** Persist the last known reset per account, so a reload during a snapshot without it keeps the projection. */
+function saveResetAt(): void {
+  void host.storage.set(RESET_AT_KEY, Object.fromEntries(lastResetAt)).catch(() => {})
+}
+
+function savePrefs(): void {
+  void host.storage.set(PREFS_KEY, { sortMode, rangeDays, showAllTools }).catch(() => {})
+}
 
 async function loadUiState(): Promise<void> {
   try {
-    const [titles, open] = await Promise.all([
+    const [titles, open, prefs, resets] = await Promise.all([
       host.storage.get(SESSION_TITLES_KEY),
-      host.storage.get(DETAILS_OPEN_KEY)
+      host.storage.get(DETAILS_OPEN_KEY),
+      host.storage.get(PREFS_KEY),
+      host.storage.get(RESET_AT_KEY)
     ])
+    if (resets && typeof resets === 'object') {
+      for (const [id, v] of Object.entries(resets as Record<string, unknown>)) {
+        // A fresh snapshot may already have set it; that one wins.
+        if (typeof v === 'number' && !lastResetAt.has(id)) lastResetAt.set(id, v)
+      }
+    }
     if (titles && typeof titles === 'object') {
       for (const [id, entry] of Object.entries(titles as Record<string, unknown>)) {
         const e = entry as { title?: unknown; seenAt?: unknown }
@@ -149,6 +182,12 @@ async function loadUiState(): Promise<void> {
       }
     }
     if (typeof open === 'boolean') detailsOpen = open
+    if (prefs && typeof prefs === 'object') {
+      const p = prefs as { sortMode?: unknown; rangeDays?: unknown; showAllTools?: unknown }
+      if (SORTS.includes(p.sortMode as SessionSort)) sortMode = p.sortMode as SessionSort
+      if (p.rangeDays === 7 || p.rangeDays === 14) rangeDays = p.rangeDays
+      if (typeof p.showAllTools === 'boolean') showAllTools = p.showAllTools
+    }
   } catch {
     // No stored state yet, or storage unavailable — start with defaults.
   } finally {
@@ -159,17 +198,13 @@ async function loadUiState(): Promise<void> {
 
 function scheduleSaveSessionTitles(): void {
   if (saveTitlesTimer) clearTimeout(saveTitlesTimer)
-  // Debounced: switching sessions repeatedly should not write on every switch.
-  // Also wait for the initial load: writing before it lands would let that
-  // load's merge (which only adds, never removes) clobber a just-renamed
-  // entry with a stale one loaded from storage.
+  // Debounced, and held back until the initial load landed: writing earlier would
+  // let that load's merge clobber a just-renamed entry with a stale one.
   saveTitlesTimer = setTimeout(() => {
     if (!sessionTitlesLoaded) {
       scheduleSaveSessionTitles()
       return
     }
-    // Keep only the most recently seen entries so the stored value cannot
-    // grow without bound over months of use.
     const trimmed = [...sessionTitleCache.entries()]
       .sort((a, b) => b[1].seenAt - a[1].seenAt)
       .slice(0, SESSION_TITLES_MAX)
@@ -188,16 +223,13 @@ function rememberSessionTitle(sessionId: string, title: string, now: number): vo
   scheduleSaveSessionTitles()
 }
 
-// The latest published plugin version, fetched from npm at most hourly.
+// Latest published version, taken from the snapshot (the plugin checks npm; the
+// panel cannot, since a sandboxed request needs a connected token integration).
 let latestVersion: string | null = null
-let latestVersionCheckedAt = 0
 
 /**
  * Compare two semver strings. Returns 1 if a > b, -1 if a < b, 0 if equal.
- *
- * Pre-release tags are ignored (compared on the numeric core only) — the panel
- * only needs "is the install behind the published release", not full semver
- * precedence.
+ * Pre-release tags are ignored; only the numeric core is compared.
  */
 function compareSemver(a: string, b: string): number {
   const parse = (v: string) =>
@@ -216,456 +248,130 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
-/**
- * Fetch the latest published version from npm, at most once an hour.
- *
- * Goes through the declared npm integration so the sandbox rule is satisfied;
- * the registry is public, so a missing/dummy token still answers 200. Any
- * failure (offline, DISCONNECTED, rate limit) leaves `latestVersion` as-is and
- * the panel simply shows the installed version without a comparison.
- */
-/**
- * Fetch the latest npm version, at most once an hour. Returns whether
- * `latestVersion` actually changed, so a background caller only repaints when
- * there is something new to show (and never loops: an unchanged result, or the
- * hourly-cached early return, reports false).
- */
-async function refreshLatestVersion(now: number): Promise<boolean> {
-  if (latestVersionCheckedAt > 0 && now - latestVersionCheckedAt < VERSION_CHECK_MS) return false
-  latestVersionCheckedAt = now
-  const before = latestVersion
-  try {
-    const result = await host.request({
-      method: 'GET',
-      path: `/${encodeURIComponent(PLUGIN_PKG)}/latest`
-    })
-    if (result.status === 200) {
-      const data = JSON.parse(result.body) as { version?: string }
-      if (data.version) latestVersion = data.version
-    }
-  } catch {
-    // Offline or not connected — keep whatever we had, no warning noise.
+/** Repaint with UI state changed; every interactive control goes through this. */
+function repaint(resetScroll = false): void {
+  if (resetScroll) resetScrollNext = true
+  void paint(true)
+}
+
+// ── shared view context + small builders ──────────────────────────────────────
+
+interface Ctx {
+  file: UsageFile
+  now: number
+  emailById: Map<string, string>
+  acc: AccountUsage
+  burn: Burn | null
+  proj: Projection
+}
+
+const estTag = (src?: string): HTMLElement => {
+  const t = el('span', 'tag-est', src ? `est. · ${src}` : 'est.')
+  t.setAttribute('aria-label', src ? `estimated, source ${src}` : 'estimated')
+  return t
+}
+
+function section(
+  parent: HTMLElement,
+  title: string,
+  opts: { est?: boolean; exact?: boolean; src?: string; info?: string; right?: HTMLElement } = {}
+): HTMLElement {
+  const box = parent.appendChild(el('section', 'sec'))
+  const head = box.appendChild(el('div', 'sec-head'))
+  head.appendChild(el('span', 'sec-title', title))
+  if (opts.est) head.appendChild(estTag(opts.src))
+  // Exact is the default a reader assumes, so only estimates carry a tag.
+  if (opts.info) head.appendChild(infoIcon(opts.info))
+  if (opts.right) {
+    const spacer = head.appendChild(el('span', 'grow'))
+    spacer.after(opts.right)
   }
-  return latestVersion !== before
+  return box
 }
 
-// ── small DOM + formatting helpers ────────────────────────────────────────────
-
-const el = (tag: string, className?: string, text?: string): HTMLElement => {
-  const node = document.createElement(tag)
-  if (className) node.className = className
-  if (text != null) node.textContent = text
-  return node
-}
-
-const NS = 'http://www.w3.org/2000/svg'
-const svgEl = (tag: string, attrs: Record<string, string | number>): SVGElement => {
-  const node = document.createElementNS(NS, tag)
-  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v))
-  return node
-}
-
-/** A stroked line-icon (Feather-style), sized in em so it scales with text. */
-function icon(paths: string, size = 0.85): SVGElement {
-  const svg = svgEl('svg', {
-    width: `${size}em`,
-    height: `${size}em`,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': 2.4,
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    class: 'ico'
-  })
-  for (const d of paths.split('|')) {
-    if (d.startsWith('circle:')) {
-      const [cx, cy, r] = d.slice(7).split(',')
-      svg.appendChild(svgEl('circle', { cx: cx!, cy: cy!, r: r! }))
-    } else {
-      svg.appendChild(svgEl('path', { d }))
-    }
+/** A key figure: label on top, value (or "not reported") below, optional sub line. */
+function tile(
+  label: string,
+  value: string | null,
+  sub?: string,
+  opts: { est?: boolean; tone?: Tone } = {}
+): HTMLElement {
+  const t = el('div', 'tile')
+  const lab = t.appendChild(el('div', 'tile-label'))
+  lab.appendChild(el('span', undefined, label))
+  if (opts.est) lab.appendChild(estTag())
+  const val = t.appendChild(el('div', 'tile-value mono'))
+  if (value == null) val.appendChild(notReported())
+  else {
+    val.textContent = value
+    if (opts.tone) val.style.color = toneText(opts.tone)
   }
-  return svg
+  if (sub) t.appendChild(el('div', 'tile-sub xs subtle', sub))
+  return t
 }
-const ICON_BOLT = 'M13 2 3 14h7l-1 8 10-12h-7z'
-const ICON_CLOCK = 'circle:12,12,9|M12 7v5l3 2'
-const ICON_CHEVRON_DOWN = 'M6 9l6 6 6-6'
-const ICON_CHEVRON_LEFT = 'M15 18l-6-6 6-6'
-const ICON_CHEVRON_RIGHT = 'M9 18l6-6-6-6'
-const ICON_INFO = 'circle:12,12,10|M12 16v-4|M12 8h.01'
 
-/**
- * An ⓘ icon carrying an explanation as a native tooltip.
- *
- * Uses title= (works inside the sandbox with no extra markup or focus trap),
- * plus aria-label and tabindex so it is reachable by keyboard and screen reader.
- */
-/**
- * An ⓘ that reveals its explanation in a CSS tooltip.
- *
- * Native title= is unreliable in the sandboxed iframe (the host suppresses it
- * or it draws outside the visible panel), so this wraps the icon and shows the
- * text from an own element on hover/focus. It positions above the icon and
- * clamps to the panel width so it never forces a horizontal scroll.
- */
-function infoIcon(text: string): HTMLElement {
-  const wrap = el('span', 'info-wrap')
-  wrap.setAttribute('tabindex', '0')
-  wrap.setAttribute('role', 'img')
-  wrap.setAttribute('aria-label', text)
-  const ico = icon(ICON_INFO, 0.85)
-  ico.classList.add('info-ico')
-  wrap.appendChild(ico)
-  const tip = el('span', 'tip', text)
-  wrap.appendChild(tip)
-  // The tooltip is anchored to the panel (full-width bubble), so vertically
-  // place it just below the icon's row on hover, wherever that row is.
-  const place = () => {
-    const rootBox = root.getBoundingClientRect()
-    const iconBox = wrap.getBoundingClientRect()
-    tip.style.top = `${iconBox.bottom - rootBox.top + root.scrollTop + 6}px`
+// Colours per account, by its position in the current account list, so an
+// account keeps its colour across rows. An account no longer in the list (removed
+// or signed out) is muted: the session rows still carry its share for up to 7 days.
+const ACCT_COLORS = ['var(--oc-primary)', 'var(--oc-info)', 'var(--oc-success)', 'var(--oc-warning)']
+
+interface AcctInfo {
+  label: string
+  color: string
+  removed: boolean
+}
+
+function acctInfo(c: Ctx, accountId: string): AcctInfo {
+  const i = c.file.accounts.findIndex((a) => a.id === accountId)
+  // --oc-muted, not --oc-subtle: subtle is meant for borders and is near-invisible on the panel background.
+  if (i === -1) return { label: accountId.slice(0, 6), color: 'var(--oc-muted)', removed: true }
+  return {
+    label: c.file.accounts[i]!.email.split('@')[0]!,
+    color: ACCT_COLORS[i % ACCT_COLORS.length]!,
+    removed: false
   }
-  wrap.addEventListener('mouseenter', place)
-  wrap.addEventListener('focus', place)
+}
+
+/** One account's chip: colour dot, name (or short id + "removed"), then the numbers. */
+function acctChip(info: AcctInfo, credits: number, requests: number): HTMLElement {
+  const chip = el('span', 'acct-chip')
+  const dot = chip.appendChild(el('span', 'dot'))
+  dot.style.background = info.color
+  const name = chip.appendChild(el('span', info.removed ? 'acct-chip-name mono acct-gone' : 'acct-chip-name', info.label))
+  if (info.removed) name.after(el('span', 'xs acct-gone', 'removed'))
+  chip.appendChild(el('span', 'mono xs subtle', `${estCr(credits)} cr · ${fmtInt(requests)} req`))
+  return chip
+}
+
+function emptyNote(text: string): HTMLElement {
+  return el('div', 'empty-note subtle xs', text)
+}
+
+function segmented<T extends string | number>(
+  options: Array<{ value: T; label: string }>,
+  current: T,
+  onPick: (v: T) => void,
+  aria: string
+): HTMLElement {
+  const wrap = el('div', 'seg')
+  wrap.setAttribute('role', 'group')
+  wrap.setAttribute('aria-label', aria)
+  for (const o of options) {
+    const b = wrap.appendChild(el('button', `seg-btn${o.value === current ? ' on' : ''}`, o.label))
+    b.setAttribute('type', 'button')
+    b.setAttribute('aria-pressed', String(o.value === current))
+    b.addEventListener('click', () => onPick(o.value))
+  }
   return wrap
 }
 
-const fmt = (n: number, digits = 2): string =>
-  n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
-
-const fmtInt = (n: number): string => Math.round(n).toLocaleString('en-US')
-
-/** "13d 4h", "4h 20m", or "12m"/"9s" from a millisecond span. */
-const fmtSpan = (ms: number, withSeconds = false): string => {
-  if (ms <= 0) return 'now'
-  const mins = Math.floor(ms / 60_000)
-  const days = Math.floor(mins / 1440)
-  const hours = Math.floor((mins % 1440) / 60)
-  const m = mins % 60
-  if (days > 0) return `${days}d ${hours}h`
-  if (hours > 0) return `${hours}h ${m}m`
-  if (m < 1 && withSeconds) return `${Math.floor(ms / 1000)}s`
-  return `${m}m`
-}
-
-/** Short reset date like "1 Oct" for the collapsed details row. */
-const fmtShortDate = (ms: number): string =>
-  new Date(ms).toLocaleDateString('en-US', { day: 'numeric', month: 'short' })
-
-/** Short approximate date for the ETA line, "≈ 28 Sep". */
-const fmtApproxDate = (ms: number): string => `≈ ${fmtShortDate(ms)}`
+const fmtDays = (d: number): string =>
+  d >= 10 ? `${Math.round(d)}d` : d >= 1 ? `${d.toFixed(1)}d` : `${Math.max(1, Math.round(d * 24))}h`
 
 /**
- * Which tone an account's usage warrants.
- *
- * Percentage alone misreads a large pool — 90% of 10k credits is still 1k
- * left, hardly an emergency — so error also triggers on a small absolute
- * remainder, which is what makes a small plan (where 95% is a handful of
- * credits) turn red at the right moment. Thresholds raised to 85/95 so the
- * warning does not cry wolf on a big plan.
- */
-type Tone = 'success' | 'warning' | 'error'
-const REMAINING_CRITICAL = 200
-function toneFor(pct: number, remaining: number): Tone {
-  if (pct >= 95 || remaining < REMAINING_CRITICAL) return 'error'
-  if (pct >= 85) return 'warning'
-  return 'success'
-}
-const toneVar = (t: Tone): string =>
-  t === 'error' ? 'var(--oc-error, #e05252)'
-    : t === 'warning' ? 'var(--oc-warning, #e8935a)'
-      : 'var(--oc-success, #4caf6a)'
-
-// ── account card (donut ring + figures + collapsible details + pager) ─────────
-
-/** Recent burn from session activity: daily average over the measured span. */
-interface Burn {
-  /** Average credits per day, over `spanMs` of actual measured history. */
-  perDay: number
-  /** How much history the average is based on (earliest activity → now). */
-  spanMs: number
-}
-
-const DAY_MS = 24 * 60 * 60 * 1000
-// Look back at most 7 days; older sessions age out of the window.
-const BURN_WINDOW_MS = 7 * DAY_MS
-const BURN_MIN_CREDITS = 1
-
-/**
- * Recent daily burn from session activity, divided by the span actually
- * measured — not a fixed 7 — so it does not lie when the history is young.
- *
- * The account's `used` is a single coarse, stepping snapshot, so differencing
- * it extrapolated bursts to absurd rates. `session_usage` records estimated
- * credits per session with real timestamps, so this sums the credits of
- * sessions active in the last 7 days and divides by the time from the earliest
- * such activity to now (clamped to the 7-day window, and to a 1-day floor so a
- * single busy hour does not read as a huge daily rate). `spanMs` is returned so
- * the UI can say how much data it is based on ("over 23h" vs "7-day avg"). As
- * days accumulate the divisor grows toward a true week. Inherits the per-session
- * estimate caveat, surfaced in the UI.
- */
-function burnFor(acc: AccountUsage, sessions: SessionUsage[], now: number): Burn | null {
-  const cutoff = now - BURN_WINDOW_MS
-  let credits = 0
-  let earliest = now
-  for (const s of sessions) {
-    const per = s.accounts?.find((a) => a.accountId === acc.id)
-    const last = per?.lastUsed ?? s.lastUsed
-    if (last < cutoff) continue
-    // Split per account on multi-account snapshots; whole session otherwise.
-    credits += per ? per.estCredits : s.estCredits
-    earliest = Math.min(earliest, Math.max(cutoff, per?.firstUsed ?? s.firstUsed))
-  }
-  if (credits < BURN_MIN_CREDITS) return null
-  // Floor the divisor at 1 day: with only a few hours of data, dividing by the
-  // raw span would turn one busy afternoon into a wildly high "per day".
-  const spanMs = now - earliest
-  const perDay = credits / Math.max(spanMs, DAY_MS) * DAY_MS
-  return { perDay, spanMs }
-}
-
-/**
- * Project the 7-day daily burn onto the days left until the reset.
- *
- * This is the question that matters — "will I make it to the reset, and by how
- * much?" — answered from only exact inputs: credits remaining, days to reset,
- * and the measured daily average. `spare` is credits expected to be left at
- * reset (positive) or the shortfall (negative); `runOutMs` is when the credits
- * would hit zero, only meaningful when short.
- */
-interface ResetOutlook {
-  daysToReset: number
-  projectedUse: number
-  spare: number
-  short: boolean
-  runOutMs: number
-}
-function resetOutlook(acc: AccountUsage, perDay: number, now: number): ResetOutlook | null {
-  if (acc.resetAt == null) return null
-  const daysToReset = (acc.resetAt - now) / DAY_MS
-  if (daysToReset <= 0) return null
-  const remaining = Math.max(0, acc.limit - acc.used)
-  const projectedUse = perDay * daysToReset
-  const spare = remaining - projectedUse
-  const runOutMs = perDay > 0 ? (remaining / perDay) * DAY_MS : Infinity
-  return { daysToReset, projectedUse, spare, short: spare < 0, runOutMs }
-}
-
-function renderAccountCard(
-  container: HTMLElement,
-  accounts: AccountUsage[],
-  sessions: SessionUsage[],
-  now: number
-): void {
-  const card = container.appendChild(el('div', 'card'))
-  const idx = ((accountIdx % accounts.length) + accounts.length) % accounts.length
-  const acc = accounts[idx]!
-  const remaining = Math.max(0, acc.limit - acc.used)
-  const t = toneFor(acc.pct, remaining)
-
-  // Header: avatar letter · email · region pill
-  const head = card.appendChild(el('div', 'acc-head'))
-  head.appendChild(el('span', 'avatar', (acc.email[0] || '?').toUpperCase()))
-  head.appendChild(el('span', 'acc-email', acc.email))
-  if (!acc.isHealthy) head.appendChild(el('span', 'pill pill-error', 'unhealthy'))
-  head.appendChild(el('span', 'pill mono', acc.region))
-
-  // Body: donut ring + figures column
-  const body = card.appendChild(el('div', 'acc-body'))
-  body.appendChild(donut(acc.pct, t))
-
-  const figures = body.appendChild(el('div', 'acc-figures'))
-  const left = figures.appendChild(el('div'))
-  const big = left.appendChild(el('span', 'mono big', fmt(remaining)))
-  big.after(el('span', 'muted xs', ' credits left'))
-  figures.appendChild(el('div', 'hr'))
-
-  // Recent burn: credits/day over the actually-measured span (see burnFor).
-  // Needs some activity to mean anything; until then show only the reset.
-  const burn = burnFor(acc, sessions, now)
-  if (burn) {
-    // Say how much history it is based on so the number is not mistaken for a
-    // settled weekly average when it is really "over the last N hours/days".
-    const spanDays = burn.spanMs / DAY_MS
-    const basis =
-      spanDays >= 6.5 ? '7-day avg'
-        : spanDays >= 1.5 ? `over ${Math.round(spanDays)}d`
-          : `over ${Math.max(1, Math.round(burn.spanMs / (60 * 60 * 1000)))}h`
-    const rateRow = figures.appendChild(el('div', 'fig-row'))
-    rateRow.appendChild(icon(ICON_BOLT))
-    const rateText = rateRow.appendChild(el('span', 'mono xs'))
-    rateText.appendChild(el('span', undefined, `≈ ${fmt(burn.perDay, 1)} cr/day`))
-    rateText.appendChild(el('span', 'subtle', ` · ${basis}`))
-    rateRow.appendChild(
-      infoIcon(
-        `Estimated credits from sessions in the last 7 days, divided by the time actually measured so far (${basis === '7-day avg' ? 'a full week' : basis.replace('over ', '')}). The divisor never drops below one day, so a single busy hour is not read as a huge daily rate. As more days accumulate it settles into a true weekly average. Only counts work on this machine.`
-      )
-    )
-
-    // The useful question: at this pace, do I make it to the reset, and by how
-    // much? Only render the ETA row when there is something real to say — never
-    // a bare clock + info with no text (the empty-row bug).
-    const outlook = resetOutlook(acc, burn.perDay, now)
-    if (outlook) {
-      const etaRow = figures.appendChild(el('div', 'fig-row'))
-      etaRow.appendChild(icon(ICON_CLOCK))
-      const etaText = etaRow.appendChild(el('span', 'mono xs'))
-      if (outlook.short) {
-        // Runs out before the reset — the day it happens is what matters.
-        etaText.style.color = toneVar(acc.pct >= 85 ? 'error' : 'warning')
-        etaText.appendChild(el('span', undefined, `~${fmt(-outlook.spare, 0)} cr short`))
-        etaText.appendChild(el('span', 'subtle', ` · empty ${fmtApproxDate(now + outlook.runOutMs)}`))
-      } else {
-        // Makes it — show the margin left at reset.
-        etaText.appendChild(el('span', undefined, `~${fmt(outlook.spare, 0)} cr spare at reset`))
-      }
-      etaRow.appendChild(
-        infoIcon(
-          'At your recent daily burn, this is how many credits you would have left when the period resets (or how many short, and the day you would run out). Estimated from your measured rate; a busier or quieter week shifts it.'
-        )
-      )
-    } else if (acc.resetAt) {
-      // Rate but no reset projection (no reset date): just the reset countdown.
-      const resetRow = figures.appendChild(el('div', 'fig-row'))
-      resetRow.appendChild(icon(ICON_CLOCK))
-      resetRow.appendChild(el('span', 'mono xs subtle', `resets in ${fmtSpan(acc.resetAt - now)}`))
-    }
-  } else {
-    // No usable burn yet — one clear line, not empty rows with lone icons.
-    const waitRow = figures.appendChild(el('div', 'fig-row'))
-    waitRow.appendChild(icon(ICON_BOLT))
-    waitRow.appendChild(el('span', 'xs subtle', 'Usage rate available after your first message'))
-    if (acc.resetAt) {
-      const resetRow = figures.appendChild(el('div', 'fig-row'))
-      resetRow.appendChild(icon(ICON_CLOCK))
-      resetRow.appendChild(el('span', 'mono xs subtle', `resets in ${fmtSpan(acc.resetAt - now)}`))
-    }
-  }
-
-  // Details toggle + collapsible plan/reset/overage
-  const toggle = card.appendChild(el('button', 'details-toggle'))
-  toggle.setAttribute('type', 'button')
-  toggle.appendChild(el('span', undefined, 'Details'))
-  const chev = toggle.appendChild(icon(ICON_CHEVRON_DOWN, 0.6))
-  chev.style.transform = detailsOpen ? 'rotate(180deg)' : 'rotate(0deg)'
-  toggle.addEventListener('click', () => {
-    detailsOpen = !detailsOpen
-    void host.storage.set(DETAILS_OPEN_KEY, detailsOpen).catch(() => {})
-    void paint(true)
-  })
-
-  if (detailsOpen) {
-    const details = card.appendChild(el('div', 'details'))
-    if (acc.plan) details.appendChild(detailRow('Plan', acc.plan))
-    if (acc.resetAt) {
-      details.appendChild(
-        detailRow('Resets', `${fmtShortDate(acc.resetAt)} · ${fmtSpan(acc.resetAt - now)} left`)
-      )
-    }
-    if (acc.overageStatus) {
-      const rate = acc.overageRate != null ? `$${fmt(acc.overageRate, 2)}/credit` : ''
-      const cap = acc.overageCap != null ? ` · cap ${fmtInt(acc.overageCap)}` : ''
-      const value =
-        acc.overageStatus === 'DISABLED' ? 'disabled' : `${rate}${cap}`.trim() || acc.overageStatus
-      details.appendChild(detailRow('Overage', value))
-    }
-    if (acc.currentOverages) {
-      details.appendChild(detailRow('Overages spent', fmt(acc.currentOverages)))
-    }
-  }
-
-  // Pager, only with more than one account
-  if (accounts.length > 1) {
-    const pager = card.appendChild(el('div', 'pager'))
-    const prev = pager.appendChild(el('button', 'navbtn'))
-    prev.setAttribute('type', 'button')
-    prev.setAttribute('aria-label', 'Previous account')
-    prev.appendChild(icon(ICON_CHEVRON_LEFT, 0.8))
-    prev.addEventListener('click', () => {
-      accountIdx = idx - 1
-      void paint(true)
-    })
-    const dots = pager.appendChild(el('span', 'dots'))
-    accounts.forEach((_, i) => {
-      const dot = dots.appendChild(el('span', 'dot'))
-      if (i === idx) dot.classList.add('dot-on')
-    })
-    const next = pager.appendChild(el('button', 'navbtn'))
-    next.setAttribute('type', 'button')
-    next.setAttribute('aria-label', 'Next account')
-    next.appendChild(icon(ICON_CHEVRON_RIGHT, 0.8))
-    next.addEventListener('click', () => {
-      accountIdx = idx + 1
-      void paint(true)
-    })
-  }
-}
-
-const CIRC = 2 * Math.PI * 36 // r=36
-function donut(pct: number, t: Tone): SVGElement {
-  const svg = svgEl('svg', { width: 88, height: 88, viewBox: '0 0 88 88', class: 'donut' })
-  svg.appendChild(
-    svgEl('circle', { cx: 44, cy: 44, r: 36, fill: 'none', stroke: 'var(--oc-border, #333)', 'stroke-width': 6.5 })
-  )
-  const arc = svgEl('circle', {
-    cx: 44, cy: 44, r: 36, fill: 'none', stroke: toneVar(t), 'stroke-width': 6.5,
-    'stroke-linecap': 'round', 'stroke-dasharray': CIRC.toFixed(2),
-    'stroke-dashoffset': (CIRC * (1 - Math.min(100, Math.max(0, pct)) / 100)).toFixed(2),
-    transform: 'rotate(-90 44 44)'
-  })
-  svg.appendChild(arc)
-  const pctText = svgEl('text', {
-    x: 44, y: 47, 'text-anchor': 'middle', 'font-size': 19, 'font-weight': 700,
-    fill: 'var(--oc-fg, #fff)'
-  })
-  pctText.textContent = `${pct}%`
-  svg.appendChild(pctText)
-  const used = svgEl('text', {
-    x: 44, y: 60, 'text-anchor': 'middle', 'font-size': 7.5, fill: 'var(--oc-muted, #888)'
-  })
-  used.textContent = 'used'
-  svg.appendChild(used)
-  return svg
-}
-
-function detailRow(label: string, value: string): HTMLElement {
-  const row = el('div', 'detail-row')
-  row.appendChild(el('span', 'subtle xs', label))
-  row.appendChild(el('span', 'mono xs muted', value))
-  return row
-}
-
-// ── sessions ──────────────────────────────────────────────────────────────────
-
-function renderSessions(
-  container: HTMLElement,
-  sessions: SessionUsage[],
-  emailById: Map<string, string>
-): void {
-  if (!sessions.length) return
-  // The section is a flex column that fills the space left under the (fixed)
-  // account card, so the heading stays put and only the row list scrolls.
-  const section = container.appendChild(el('div', 'sessions-section'))
-  const heading = section.appendChild(el('div', 'sec-head'))
-  heading.appendChild(el('span', 'sec-title', 'Recent sessions'))
-  heading.appendChild(el('span', 'subtle xs', '(estimated)'))
-  // The estimate caveat lives in an info tooltip on the heading.
-  heading.appendChild(
-    infoIcon(
-      'Credits per session are estimated: Kiro bills per request, not per token, and the account total is split across sessions by request share. A shared account mixes in other users.'
-    )
-  )
-
-  const list = section.appendChild(el('div', 'sessions'))
-  for (const s of sessions.slice(0, 12)) renderSessionRow(list, s, emailById)
-}
-
-/**
- * The best readable name for a session row, in priority order:
- * the plugin's recorded title, the host title (for the active/known session),
- * the directory basename, then the raw session id (shown muted-mono).
+ * The best readable name for a session row, in priority order: the plugin's
+ * recorded title, the host title (for the active/known session), the directory
+ * basename, then the raw session id (shown muted-mono).
  */
 function sessionName(s: SessionUsage, isCurrent: boolean): { text: string; isId: boolean } {
   const cached = sessionTitleCache.get(s.sessionId)?.title
@@ -677,48 +383,858 @@ function sessionName(s: SessionUsage, isCurrent: boolean): { text: string; isId:
   return { text: s.sessionId, isId: true }
 }
 
+/** Direct chats live under OpenChamber's own chats store, which is not a project. */
+function projectDir(s: SessionUsage): string | null {
+  const dir = s.directory
+  if (!dir || /[/\\]openchamber[/\\]chats[/\\]/i.test(dir)) return null
+  return dir
+}
+
+// ── 1. account hero ───────────────────────────────────────────────────────────
+
+function renderAccountChips(parent: HTMLElement, c: Ctx): void {
+  const accounts = c.file.accounts
+  if (accounts.length < 2) return
+  const row = parent.appendChild(el('div', 'chips'))
+  row.setAttribute('role', 'tablist')
+  row.setAttribute('aria-label', 'Kiro account')
+  accounts.forEach((a, i) => {
+    const on = a.id === c.acc.id
+    const chip = row.appendChild(el('button', `chip${on ? ' on' : ''}`))
+    chip.setAttribute('type', 'button')
+    chip.setAttribute('role', 'tab')
+    chip.setAttribute('aria-selected', String(on))
+    const left = Math.max(0, a.limit - a.used)
+    const t = toneFor(a.pct, left)
+    const dot = chip.appendChild(el('span', 'dot'))
+    dot.style.background = toneVar(t)
+    chip.appendChild(el('span', 'chip-name', a.email.split('@')[0]))
+    chip.appendChild(el('span', 'mono xs subtle', `${a.pct}%`))
+    chip.addEventListener('click', () => {
+      accountIdx = i
+      repaint()
+    })
+  })
+}
+
+function renderHero(parent: HTMLElement, c: Ctx): void {
+  const { acc, proj, burn, now } = c
+  const card = parent.appendChild(el('section', 'sec hero'))
+
+  const hasLimit = Number.isFinite(acc.limit) && acc.limit > 0 && Number.isFinite(acc.used)
+  const pct = hasLimit ? (Number.isFinite(acc.pct) ? acc.pct : Math.round((acc.used / acc.limit) * 100)) : null
+  const tone: Tone = pct != null ? toneFor(pct, proj.remaining) : 'success'
+
+  const head = card.appendChild(el('div', 'acc-head'))
+  head.appendChild(el('span', 'avatar', (acc.email[0] || '?').toUpperCase()))
+  head.appendChild(el('span', 'acc-email', acc.email))
+  if (!acc.isHealthy) head.appendChild(el('span', 'pill pill-error', 'unhealthy'))
+  head.appendChild(el('span', 'pill mono', acc.region))
+
+  const body = card.appendChild(el('div', 'acc-body'))
+  if (pct != null) body.appendChild(ring(pct, tone))
+  else body.appendChild(el('div', 'ring-nr')).appendChild(notReported())
+
+  const figures = body.appendChild(el('div', 'acc-figures'))
+  const left = figures.appendChild(el('div'))
+  if (hasLimit) {
+    left.appendChild(el('span', 'mono big', fmt(proj.remaining)))
+    left.appendChild(el('span', 'muted xs', ' credits left'))
+    figures.appendChild(el('div', 'xs subtle mono', `${fmt(acc.used)} of ${fmtInt(acc.limit)} used`))
+  } else {
+    left.appendChild(notReported())
+    left.appendChild(el('span', 'muted xs', ' credits left'))
+  }
+
+  figures.appendChild(el('div', 'hr'))
+
+  const rateRow = figures.appendChild(el('div', 'fig-row'))
+  rateRow.appendChild(icon(ICON_BOLT))
+  const rate = proj.recentPace ?? proj.periodPace
+  if (rate) {
+    const txt = rateRow.appendChild(el('span', 'mono xs'))
+    txt.textContent = `≈ ${fmt(rate.perWorkday, 0)} cr/working day`
+    txt.textContent = ''
+    txt.appendChild(el('span', 'rate-val', `≈ ${fmt(rate.perWorkday, 0)} cr/workday`))
+    const basis = !proj.recentPace
+      ? 'month avg'
+      : burn && burn.spanMs / DAY_MS >= 6.5
+        ? 'last 7 days'
+        : `last ${Math.max(1, Math.round((burn?.spanMs ?? 0) / DAY_MS))}d`
+    txt.appendChild(el('span', 'subtle rate-basis', basis))
+    // Exact when it comes from Kiro's counter (recent) or from `used` itself (month average).
+    const exact = !proj.recentPace || burn?.exact === true
+    if (!exact) rateRow.appendChild(estTag())
+    rateRow.appendChild(
+      infoIcon(
+        !proj.recentPace
+          ? 'Credits used this period (exact, Kiro’s counter) divided by the working days (Monday to Friday) so far. Used until Kiro’s counter has been recorded for 3 days. The period start is assumed to be one month before the reset.'
+          : burn?.exact
+            ? 'How much Kiro’s own credit counter rose over the recorded span, divided by the working days (Monday to Friday) in it. Exact for this account, from every machine that uses it.'
+            : 'Credits the plugin measured for the recent window, divided by the working days (Monday to Friday) it spans.'
+      )
+    )
+  } else {
+    rateRow.appendChild(el('span', 'xs subtle', 'Usage rate available after your first message'))
+  }
+
+  // Period: day N of M, plus credits-used vs time-elapsed so overspending shows.
+  if (proj.period && pct != null) {
+    const p = proj.period
+    const block = card.appendChild(el('div', 'period'))
+    const line = block.appendChild(el('div', 'period-line'))
+    const approx = p.approx ? '≈ ' : ''
+    line.appendChild(el('span', 'mono xs', `${approx}Day ${p.dayNo} of ${Math.round(p.lenDays)}`))
+    if (acc.resetAt) {
+      line.appendChild(
+        el(
+          'span',
+          'mono xs subtle',
+          proj.resetOverdue ? 'reset due' : `resets in ${fmtSpan(acc.resetAt - now)} · ${fmtShortDate(acc.resetAt)}`
+        )
+      )
+    }
+    const track = block.appendChild(el('div', 'pbar'))
+    track.setAttribute('role', 'img')
+    track.setAttribute(
+      'aria-label',
+      `${pct}% of credits used, ${Math.round(p.timePct)}% of the period elapsed`
+    )
+    const fill = track.appendChild(el('div', 'pbar-fill'))
+    fill.style.width = `${Math.min(100, Math.max(0, pct))}%`
+    fill.style.background = toneVar(tone)
+    const mark = track.appendChild(el('div', 'pbar-mark'))
+    mark.style.left = `${Math.min(100, Math.max(0, p.timePct))}%`
+    block.appendChild(
+      el('div', 'xs subtle', `${pct}% of credits used · ${Math.round(p.timePct)}% of the period elapsed`)
+    )
+  } else if (acc.resetAt) {
+    const row = card.appendChild(el('div', 'fig-row'))
+    row.appendChild(icon(ICON_CLOCK))
+    row.appendChild(
+      el('span', 'mono xs subtle', proj.resetOverdue ? 'reset due' : `resets in ${fmtSpan(acc.resetAt - now)}`)
+    )
+  } else {
+    const row = card.appendChild(el('div', 'fig-row'))
+    row.appendChild(icon(ICON_CLOCK))
+    row.appendChild(el('span', 'xs subtle', 'Reset date '))
+    row.appendChild(notReported())
+  }
+
+  renderProjection(card, c, pct)
+
+  // Details toggle + collapsible plan/reset/overage
+  const toggle = card.appendChild(el('button', 'details-toggle'))
+  toggle.setAttribute('type', 'button')
+  toggle.setAttribute('aria-expanded', String(detailsOpen))
+  toggle.appendChild(el('span', undefined, 'Details'))
+  const chev = toggle.appendChild(icon(ICON_CHEVRON_DOWN, 0.6))
+  chev.style.transform = detailsOpen ? 'rotate(180deg)' : 'rotate(0deg)'
+  toggle.addEventListener('click', () => {
+    detailsOpen = !detailsOpen
+    void host.storage.set(DETAILS_OPEN_KEY, detailsOpen).catch(() => {})
+    repaint()
+  })
+
+  if (detailsOpen) {
+    const d = card.appendChild(el('div', 'details'))
+    d.appendChild(detailRow('Plan', acc.plan))
+    if (acc.resetAt) {
+      d.appendChild(
+        detailRow('Resets', `${fmtShortDate(acc.resetAt)} · ${proj.resetOverdue ? 'due' : fmtSpan(acc.resetAt - now) + ' left'}`)
+      )
+    } else d.appendChild(detailRow('Resets', undefined))
+    if (proj.period) {
+      d.appendChild(
+        detailRow(
+          proj.period.approx ? 'Period start (≈)' : 'Period start',
+          `${fmtShortDate(proj.period.startMs)} · ${Math.floor(proj.period.daysUsed)}d used`
+        )
+      )
+    }
+    if (acc.overageStatus) {
+      const rate = acc.overageRate != null ? `$${fmt(acc.overageRate, 2)}/credit` : ''
+      const cap = acc.overageCap != null ? ` · cap ${fmtInt(acc.overageCap)}` : ''
+      d.appendChild(
+        detailRow('Overage', acc.overageStatus === 'DISABLED' ? 'disabled' : `${rate}${cap}`.trim() || acc.overageStatus)
+      )
+    } else d.appendChild(detailRow('Overage', undefined))
+    if (acc.currentOverages) d.appendChild(detailRow('Overages spent', fmt(acc.currentOverages)))
+    d.appendChild(detailRow('Synced', acc.updatedAt ? fmtAgo(acc.updatedAt, now) : undefined))
+  }
+}
+
+function detailRow(label: string, value: string | undefined): HTMLElement {
+  const row = el('div', 'detail-row')
+  row.appendChild(el('span', 'subtle xs', label))
+  if (value == null || value === '') row.appendChild(notReported())
+  else row.appendChild(el('span', 'mono xs muted', value))
+  return row
+}
+
+/**
+ * "Will I make it to the reset?" Credits left and the reset date are exact and give a budget per
+ * working day. The pace is judged two ways (this month's average, and the last 7 days) and the
+ * card says so when they disagree, instead of picking one and sounding sure.
+ */
+function renderProjection(card: HTMLElement, c: Ctx, pct: number | null): void {
+  const { proj, acc, now } = c
+  const box = card.appendChild(el('div', 'proj'))
+  let tone: Tone | null = null
+  const text = el('div', 'proj-text')
+  const main = text.appendChild(el('div', 'proj-main'))
+  const sub = text.appendChild(el('div', 'proj-sub xs'))
+  const cr = (n: number): string => `${fmt(n, 0)} cr`
+  const { periodPace: pp, recentPace: rp, budgetPerWorkday: budget } = proj
+  const known = [pp, rp].filter((p): p is PaceView => p != null)
+
+  if (pct == null) {
+    main.appendChild(el('span', undefined, 'Projection '))
+    main.appendChild(notReported())
+  } else if (proj.resetOverdue) {
+    main.textContent = 'Reset date has passed'
+    sub.textContent = 'Waiting for the next usage sync.'
+  } else if (!proj.verdict || budget == null) {
+    const only = rp ?? pp
+    if (only?.runOutAt != null) {
+      main.textContent = `Credits last ~${fmtDays((only.runOutAt - now) / DAY_MS)} (${fmtApproxDate(only.runOutAt)})`
+      sub.textContent = 'Reset date not reported, so no comparison with the reset.'
+    } else {
+      main.textContent = 'Projection needs a measured burn'
+      sub.textContent = 'Available after your first message this period.'
+    }
+  } else if (proj.verdict === 'ok') {
+    tone = 'success'
+    const spare = Math.min(...known.map((p) => p.spare ?? Infinity))
+    main.textContent = `Lasts to the reset · ~${fmt(spare, 0)} cr to spare`
+    sub.textContent = `You can spend ~${cr(budget)} per working day · now ≈ ${cr((rp ?? pp)!.perWorkday)}`
+  } else if (proj.verdict === 'maybe' && pp && rp) {
+    tone = 'warning'
+    main.textContent = `Could run out ${fmtApproxDate(rp.runOutAt!)} if last week's pace holds`
+    sub.textContent = `This month's average (≈ ${cr(pp.perWorkday)}/day) leaves ~${fmt(pp.spare ?? 0, 0)} cr spare, the last 7 days (≈ ${cr(rp.perWorkday)}/day) do not. You can spend ~${cr(budget)} per working day.`
+  } else {
+    // Neither pace makes it: quote the less pessimistic one, so the warning is never overstated.
+    const later = [...known].sort((x, y) => (y.runOutAt ?? 0) - (x.runOutAt ?? 0))[0]!
+    const days = ((later.runOutAt ?? now) - now) / DAY_MS
+    tone = pct >= 85 ? 'error' : 'warning'
+    main.textContent = `Runs out in ~${fmtDays(days)} (${fmtApproxDate(later.runOutAt!)})`
+    sub.textContent = `${fmtDays((proj.daysToReset ?? 0) - days)} before the reset · ~${fmt(-(later.spare ?? 0), 0)} cr short · budget ~${cr(budget)} per working day`
+  }
+
+  if (tone) {
+    box.classList.add(`proj-${tone}`)
+    box.appendChild(icon(tone === 'success' ? ICON_BOLT : ICON_ALERT, 1))
+  }
+  box.appendChild(text)
+  if (tone) {
+    const tagWrap = box.appendChild(el('span', 'proj-tags'))
+    tagWrap.appendChild(estTag())
+    tagWrap.appendChild(
+      infoIcon(
+        `Credits left (exact) and the reset date (${acc.resetAt ? fmtShortDate(acc.resetAt) : 'n/a'}, exact) give a budget per working day. Your pace is compared two ways: this month's average (credits used ÷ working days so far, exact) and the last 7 days (estimated). A working day is Monday to Friday, a 40-hour week; weekends count zero. The period start is assumed to be one month before the reset. The result depends on whether your recent pace continues.`
+      )
+    )
+  }
+}
+
+// ── 2. key figures ────────────────────────────────────────────────────────────
+
+function renderTiles(parent: HTMLElement, c: Ctx): void {
+  const { file, acc } = c
+  const grid = parent.appendChild(el('div', 'tiles'))
+  const win = file.burn?.find((b) => b.accountId === acc.id)?.windowDays ?? file.tools?.windowDays ?? null
+  const span = win != null ? `${win}d` : 'window'
+
+  // burn[].requests counts every session active in the window, per account, and is exact.
+  const req = requests7d(acc.id, file.burn)
+  grid.appendChild(
+    tile(`Requests · ${span}`, req != null ? fmtInt(req) : null, file.accounts.length > 1 ? 'this account' : undefined)
+  )
+
+  // Credits and requests of the same sessions: only those whose credits are fully measured.
+  const cpr = creditsPerRequest(file, acc.id)
+  const cprTile = grid.appendChild(
+    tile(
+      'Credits / request',
+      cpr ? (cpr.measured ? fmt(cpr.value, 2) : estCr(cpr.value, 2)) : null,
+      cpr
+        ? cpr.measured && typeof file.meteredSince === 'number'
+          ? `since ${fmtShortDate(file.meteredSince)}`
+          : 'average'
+        : 'needs 50 metered requests',
+      { est: !cpr?.measured }
+    )
+  )
+  cprTile.title =
+    'Average credits per request on this account, over sessions begun since the plugin measures credits per response. Older sessions are left out because their credits were overcounted. A rising number means heavier requests: bigger context or a costlier model.'
+
+}
+
+// ── 3. credits per day ────────────────────────────────────────────────────────
+
+function renderTrend(parent: HTMLElement, c: Ctx): void {
+  // The plugin does not record per-day totals: show nothing rather than an empty section.
+  if (!c.file.daily?.length) return
+  const { file, acc, now } = c
+  const series = dailySeries(file.daily, acc.id, now, 14)
+  const right = segmented<Range>(
+    [
+      { value: 7, label: '7d' },
+      { value: 14, label: '14d' }
+    ],
+    rangeDays,
+    (v) => {
+      rangeDays = v
+      savePrefs()
+      repaint()
+    },
+    'Range'
+  )
+  const box = section(parent, 'Credits per day', {
+    est: true,
+    src: 'Kiro',
+    info:
+      'Estimated: Kiro reports credits only as an account total, so the plugin apportions each change in that total across the requests made that day. Hatched bars are days before the plugin started recording, which are not reported, not zero.',
+    right
+  })
+
+  if (!series) {
+    box.appendChild(emptyNote('Daily history not reported: the plugin does not record per-day totals yet.'))
+    const burn = c.burn
+    if (burn) box.appendChild(el('div', 'xs subtle mono', `Recent burn ≈ ${fmt(burn.perDay, 1)} cr/day (est.)`))
+    return
+  }
+
+  const shown = series.slice(-rangeDays)
+  const stats = trendStats(shown)
+  const full = trendStats(series)
+  const avg = stats ? stats.avg : null
+
+  const chart = barChart(
+    shown.map((p) => ({
+      value: p.credits,
+      today: p.today,
+      aria: `${fmtDay(p.ms)}: ${p.credits == null ? 'not reported' : `about ${fmt(p.credits, 1)} credits, estimated`}`
+    })),
+    avg,
+    (i) => showDay(i)
+  )
+  box.appendChild(chart.node)
+
+  const axis = box.appendChild(el('div', 'axis xs subtle'))
+  axis.appendChild(el('span', undefined, fmtShortDate(shown[0]!.ms)))
+  axis.appendChild(el('span', undefined, 'today'))
+
+  const readout = box.appendChild(el('div', 'readout mono xs'))
+  const summary = () => {
+    readout.replaceChildren()
+    if (!stats) {
+      readout.appendChild(notReported())
+      return
+    }
+    readout.appendChild(el('span', undefined, `${estCr(stats.total)} cr`))
+    readout.appendChild(el('span', 'subtle', ` in ${rangeDays}d · avg ${estCr(stats.avg)}/day`))
+    if (rangeDays === 14 && full?.weekDelta != null) {
+      const up = full.weekDelta > 0
+      const d = readout.appendChild(
+        el('span', undefined, `  ${up ? '▲' : '▼'} ${Math.abs(Math.round(full.weekDelta))}% vs prev week`)
+      )
+      d.style.color = up ? 'var(--oc-warning-text)' : 'var(--oc-success-text)'
+    }
+  }
+  const showDay = (i: number) => {
+    const p = shown[i]
+    if (!p) return
+    readout.replaceChildren()
+    readout.appendChild(el('span', 'subtle', `${fmtDay(p.ms)}  `))
+    if (p.credits == null) readout.appendChild(notReported())
+    else {
+      readout.appendChild(el('span', undefined, `${estCr(p.credits)} cr`))
+      readout.appendChild(
+        el('span', 'subtle', ` · ${p.requests != null ? fmtInt(p.requests) : '?'} req`)
+      )
+      if (p.toolCalls != null) readout.appendChild(el('span', 'subtle', ` · ${fmtInt(p.toolCalls)} tools`))
+    }
+  }
+  chart.node.addEventListener('mouseleave', () => {
+    summary()
+    chart.select(-1)
+  })
+  summary()
+}
+
+// ── 4. tool usage ─────────────────────────────────────────────────────────────
+
+/**
+ * A tool name in a tool list. `execute` gets a note: a Code Mode script is one call to OpenCode,
+ * and the tool calls it makes inside are not recorded separately.
+ *
+ * @param parent the row head to append to
+ * @param name the tool name
+ */
+function toolName(parent: HTMLElement, name: string): void {
+  const n = parent.appendChild(el('span', 'mono trow-name', name))
+  if (name === 'execute') {
+    n.appendChild(
+      infoIcon('One Code Mode script counts as one call. The tool calls it makes inside are not recorded separately, so the real number of tool calls is higher.')
+    )
+  }
+}
+
+function renderTools(parent: HTMLElement, c: Ctx): void {
+  const agg = aggregateTools(c.file)
+  const box = section(parent, 'Tool usage', {
+    info: 'Tool calls counted from OpenCode’s history. Kiro reports no cost per tool call, so the ranking is by number of calls.'
+  })
+  if (!agg) {
+    box.appendChild(emptyNote('Tool usage not reported: the plugin does not store tool calls yet.'))
+    return
+  }
+
+  const scope =
+    agg.source === 'plugin'
+      ? `${fmtInt(agg.total)} calls · last ${agg.windowDays}d`
+      : `${fmtInt(agg.total)} calls · ${agg.sessionCount} recent session${agg.sessionCount === 1 ? '' : 's'}`
+  box.appendChild(el('div', 'xs subtle mono', scope))
+
+  const LIMIT = 8
+  const items = showAllTools ? agg.items : agg.items.slice(0, LIMIT)
+  const max = Math.max(1, ...agg.items.map((t) => t.count))
+  const list = box.appendChild(el('div', 'tools'))
+  for (const t of items) {
+    const row = list.appendChild(el('div', 'trow'))
+    const top = row.appendChild(el('div', 'trow-top'))
+    toolName(top, t.name)
+    top.appendChild(el('span', 'mono xs trow-nums', `×${fmtInt(t.count)}`))
+    row.appendChild(hbar(t.count / max, 'var(--oc-info)'))
+  }
+  if (agg.items.length > LIMIT) {
+    const more = box.appendChild(
+      el('button', 'linkbtn', showAllTools ? 'Show fewer' : `Show all ${agg.items.length} tools`)
+    )
+    more.setAttribute('type', 'button')
+    more.addEventListener('click', () => {
+      showAllTools = !showAllTools
+      savePrefs()
+      repaint()
+    })
+  }
+
+}
+
+// ── tokens ────────────────────────────────────────────────────────────────────
+
+const TOKEN_PARTS: Array<{ key: keyof TokenCounts; label: string; color: string; hint: string }> = [
+  { key: 'uncachedInputTokens', label: 'Input', color: 'var(--oc-primary)', hint: 'derived from Kiro’s context %' },
+  { key: 'cacheReadTokens', label: 'Cache read', color: 'var(--oc-info)', hint: 'repeated context from cache, the cheap part' },
+  { key: 'cacheWriteTokens', label: 'Cache write', color: 'var(--oc-warning)', hint: 'context written to the cache' },
+  { key: 'outputTokens', label: 'Output', color: 'var(--oc-success)', hint: 'generated tokens' }
+]
+
+/** Stacked bar + legend for exact token counts, cache-read shown on its own. */
+function tokenBreakdown(box: HTMLElement, t: TokenCounts, requests: number | null): void {
+  const total = promptTokens(t) + t.outputTokens
+  if (t.reportedRequests <= 0 || total <= 0) {
+    const n = box.appendChild(el('div', 'xs subtle'))
+    n.appendChild(el('span', undefined, 'Tokens '))
+    n.appendChild(notReported())
+    return
+  }
+  const stack = box.appendChild(el('div', 'stack'))
+  stack.setAttribute('role', 'img')
+  stack.setAttribute('aria-label', 'Token split: input, cache read, cache write, output')
+  for (const part of TOKEN_PARTS) {
+    const v = t[part.key] as number
+    if (v <= 0) continue
+    const seg = stack.appendChild(el('i'))
+    seg.style.width = `${(v / total) * 100}%`
+    seg.style.background = part.color
+  }
+  const legend = box.appendChild(el('div', 'legend'))
+  const noCache = t.cacheReadTokens <= 0 && t.cacheWriteTokens <= 0
+  for (const part of TOKEN_PARTS) {
+    const v = t[part.key] as number
+    // Kiro does not report a cache split for most models: an all-zero cache row is
+    // noise, so say so once below instead of drawing "0 · 0%".
+    if (noCache && (part.key === 'cacheReadTokens' || part.key === 'cacheWriteTokens')) continue
+    const row = legend.appendChild(el('div', 'legend-row'))
+    const dot = row.appendChild(el('span', 'dot'))
+    dot.style.background = part.color
+    row.appendChild(el('span', 'legend-label xs', part.label))
+    row.appendChild(el('span', 'mono xs', `~${fmtCompact(v)}`))
+    row.appendChild(el('span', 'mono xs subtle legend-pct', `${Math.round((v / total) * 100)}%`))
+  }
+  // Kiro sends no cache figures (the plugin fills in 0), so an all-zero cache split is hidden
+  // without comment. reportedRequests is every finished message, so it carries no "floor" note.
+  const prompt = promptTokens(t)
+  if (!noCache && prompt > 0 && t.cacheReadTokens > 0) {
+    box.appendChild(
+      el('div', 'xs subtle', `${Math.round((t.cacheReadTokens / prompt) * 100)}% of prompt tokens were cache reads`)
+    )
+  }
+  void requests
+}
+
+/** Why sessions begun before per-response metering read high. */
+const PRE_METERING_INFO =
+  'Sessions begun before per-response metering carry credits apportioned from the account counter. Several OpenCode instances could book the same rise, so those run high (measured roughly 1.4 to 1.7 times the counter). Newer sessions are metered per response.'
+
+/** What the token numbers are, since Kiro reports none itself. */
+const TOKENS_INFO =
+  'Estimated by the plugin: Kiro sends no token counts. Output is about 4 characters per token of the reply, reasoning and tool input. Input is Kiro’s context percentage times the model window the plugin assumes (1M for auto), so it is off if auto routes to a model with another window. Kiro bills credits per request, so tokens do not convert to credits.'
+
+function renderTokens(parent: HTMLElement, c: Ctx): void {
+  const box = section(parent, 'Tokens', {
+    est: true,
+    src: 'plugin',
+    info: TOKENS_INFO
+  })
+  const sum = tokenSummary(c.file, accountsInUse(c.file))
+  if (!sum) {
+    box.appendChild(emptyNote('Tokens not reported: the plugin has not written token totals yet.'))
+    return
+  }
+  box.appendChild(
+    el(
+      'div',
+      'xs subtle mono',
+      sum.scope === 'window' ? `last ${sum.windowDays}d` : `${sum.sessions} recent session${sum.sessions === 1 ? '' : 's'}`
+    )
+  )
+  tokenBreakdown(box, sum.counts, sum.requests)
+}
+
+// ── 5. per-account overview ───────────────────────────────────────────────────
+
+function renderAccounts(parent: HTMLElement, c: Ctx): void {
+  if (c.file.accounts.length < 2) return
+  const box = section(parent, 'Accounts', {
+    info: 'Credits left and requests are exact; burn per day is an estimate.'
+  })
+  const list = box.appendChild(el('div', 'acct-list'))
+  c.file.accounts.forEach((a, i) => {
+    const left = Math.max(0, a.limit - a.used)
+    const t = toneFor(a.pct, left)
+    const b = list.appendChild(el('button', `acct-row${a.id === c.acc.id ? ' on' : ''}`))
+    b.setAttribute('type', 'button')
+    b.addEventListener('click', () => {
+      accountIdx = i
+      repaint()
+    })
+    b.appendChild(ring(a.pct, t, 34, 9, false))
+    const mid = b.appendChild(el('div', 'acct-mid'))
+    mid.appendChild(el('div', 'acct-name', a.email))
+    const meta = mid.appendChild(el('div', 'xs subtle mono'))
+    meta.appendChild(el('span', undefined, `${fmt(left, 0)} left`))
+    const burn = recentBurn(c.file, a, c.now)
+    meta.appendChild(el('span', undefined, burn ? ` · ≈${fmt(burn.perDay, 0)} cr/day` : ' · '))
+    if (!burn) meta.appendChild(notReported())
+    const req = requests7d(a.id, c.file.burn)
+    const right = b.appendChild(el('div', 'acct-req mono xs'))
+    if (req != null) {
+      right.appendChild(el('span', undefined, fmtInt(req)))
+      right.appendChild(el('span', 'subtle', ' req · 7d'))
+    } else {
+      right.appendChild(notReported())
+    }
+  })
+}
+
+// ── 6. sessions ───────────────────────────────────────────────────────────────
+
+const SORT_LABEL: Record<SessionSort, string> = {
+  cost: 'Cost',
+  recent: 'Recent',
+  requests: 'Requests',
+  tokens: 'Tokens'
+}
+
+function renderSessions(parent: HTMLElement, c: Ctx): void {
+  const sessions = c.file.sessions
+  const total = c.file.sessionsTotal
+  const box = section(parent, 'Sessions', {
+    est: true,
+    src: 'plugin',
+    info:
+      `Credits per session come from the plugin, not from Kiro: Kiro only reports an account total. ${PRE_METERING_INFO} Requests, tool calls and turn mix are exact.`,
+    right: el('span', 'xs subtle mono', total != null && total > sessions.length ? `${sessions.length} of ${fmtInt(total)}` : '')
+  })
+
+  if (!sessions.length) {
+    box.appendChild(emptyNote('No sessions recorded yet. They appear after your first message.'))
+    return
+  }
+
+  box.appendChild(
+    segmented<SessionSort>(
+      SORTS.map((s) => ({ value: s, label: SORT_LABEL[s] })),
+      sortMode,
+      (v) => {
+        sortMode = v
+        savePrefs()
+        repaint()
+      },
+      'Sort sessions'
+    )
+  )
+
+  const sorted = sortSessions(sessions, sortMode)
+  const maxCredits = Math.max(1e-9, ...sessions.map((s) => s.estCredits))
+  // Only metered sessions compete for "priciest": the overcounted old ones would always win.
+  const metered = sessions.filter((s) => !isPreMetering(c.file, s))
+  const priciest = metered.length > 2 ? metered.reduce((m, s) => (s.estCredits > m.estCredits ? s : m)) : null
+  const preCount = sessions.length - metered.length
+  if (preCount > 0 && typeof c.file.meteredSince === 'number') {
+    const note = box.appendChild(el('div', 'xs subtle pre-note'))
+    note.textContent = `${preCount} of ${sessions.length} began before metering (${fmtShortDate(c.file.meteredSince)}). Their credits, dimmed, likely run high. `
+    note.appendChild(infoIcon(PRE_METERING_INFO))
+  }
+  const list = box.appendChild(el('div', 'sessions'))
+  const SESSION_LIMIT = 15
+  const shown = showAllSessions ? sorted : sorted.slice(0, SESSION_LIMIT)
+  for (const s of shown) renderSessionRow(list, s, c, maxCredits, s === priciest)
+  if (sorted.length > SESSION_LIMIT) {
+    const more = box.appendChild(
+      el('button', 'linkbtn', showAllSessions ? 'Show fewer' : `Show all ${sorted.length} sessions`)
+    )
+    more.setAttribute('type', 'button')
+    more.addEventListener('click', () => {
+      showAllSessions = !showAllSessions
+      repaint()
+    })
+  }
+}
+
 function renderSessionRow(
-  container: HTMLElement,
+  list: HTMLElement,
   s: SessionUsage,
-  emailById: Map<string, string>
+  c: Ctx,
+  maxCredits: number,
+  isPriciest: boolean
 ): void {
   const isCurrent = currentSessionId != null && s.sessionId === currentSessionId
   const name = sessionName(s, isCurrent)
-
-  const row = container.appendChild(el('button', `srow${isCurrent ? ' current' : ''}`))
+  const row = list.appendChild(el('button', `srow${isCurrent ? ' current' : ''}`))
   row.setAttribute('type', 'button')
-  row.addEventListener('click', () => void host.openSession(s.sessionId).catch(() => {}))
+  row.addEventListener('click', () => {
+    detailId = s.sessionId
+    repaint(true)
+  })
 
   const top = row.appendChild(el('div', 'srow-top'))
   const left = top.appendChild(el('div', 'srow-name'))
-  // A raw id renders muted-mono, like the design; a real title renders plain.
   left.appendChild(el('span', name.isId ? 'srow-title mono muted' : 'srow-title', name.text))
   if (isCurrent) left.appendChild(el('span', 'mono now', 'now'))
+  if (isPriciest) left.appendChild(el('span', 'badge-warn', 'priciest'))
+  const pre = isPreMetering(c.file, s)
+  const fig = top.appendChild(el('span', 'srow-figures mono'))
+  const cr = fig.appendChild(el('span', pre ? 'srow-credits pre' : 'srow-credits', estCr(s.estCredits)))
+  if (pre) cr.title = 'Pre-metering: likely too high'
+  fig.appendChild(el('span', 'subtle', ' cr'))
 
-  const figures = top.appendChild(el('span', 'srow-figures mono'))
-  figures.appendChild(el('span', 'srow-credits', fmt(s.estCredits, 1)))
-  figures.appendChild(el('span', 'subtle', ` cr · ${s.requests} req`))
-
-  // The directory, only when it is a real project path that adds something.
-  // Direct chats live under OpenChamber's own chats store
-  // (…/openchamber/chats/…), which is not a project location — showing it is
-  // just noise, so those are suppressed.
-  const dir = s.directory
-  const isChatStore = !!dir && /[/\\]openchamber[/\\]chats[/\\]/i.test(dir)
-  if (!name.isId && dir && !isChatStore && dir.split('/').pop() !== name.text) {
-    row.appendChild(el('div', 'srow-path mono subtle', dir))
+  // A session that ran on several accounts shows its bar split by account.
+  const multi = s.accounts && s.accounts.length > 1 ? s.accounts : null
+  if (multi) {
+    row.appendChild(
+      segBar(
+        multi.map((a) => ({ value: a.estCredits, color: acctInfo(c, a.accountId).color })),
+        s.estCredits / maxCredits
+      )
+    )
+  } else {
+    row.appendChild(hbar(s.estCredits / maxCredits, isPriciest ? 'var(--oc-warning)' : 'var(--oc-primary)'))
   }
 
-  // Per-account split, only when more than one account served the session.
-  if (s.accounts && s.accounts.length > 1) {
-    const split = s.accounts
-      .map((a) => {
-        const who = (emailById.get(a.accountId) ?? a.accountId).split('@')[0]!.slice(0, 12)
-        return `${who}: ~${fmt(a.estCredits, 1)} cr · ${a.requests} req`
+  // One line: project, requests, age. Tools, turns and context live in the drill-down.
+  const meta = row.appendChild(el('div', 'srow-meta mono xs subtle'))
+  const dir = projectDir(s)
+  const project = dir ? dir.split('/').filter(Boolean).pop() : undefined
+  if (project && project !== name.text) {
+    meta.appendChild(el('span', 'srow-proj', project)).title = dir!
+    meta.appendChild(el('span', undefined, '\u00a0·\u00a0'))
+  }
+  meta.appendChild(el('span', undefined, `${fmtInt(s.requests)} req · ${fmtAgo(s.lastUsed, c.now)}`))
+  const turns = turnSplit(s)
+  if (turns && turns.error > 0) {
+    meta.appendChild(el('span', undefined, '\u00a0·\u00a0'))
+    const e = meta.appendChild(el('span', undefined, `${fmtInt(turns.error)} failed`))
+    e.style.color = toneText('error')
+  }
+  if (multi) {
+    const legend = row.appendChild(el('div', 'srow-accts'))
+    for (const a of [...multi].sort((x, y) => y.estCredits - x.estCredits)) {
+      legend.appendChild(acctChip(acctInfo(c, a.accountId), a.estCredits, a.requests))
+    }
+  }
+}
+
+// ── 7. session drill-down ─────────────────────────────────────────────────────
+
+/** Stacked bar plus legend. `total` is the sum the parts add up to; `fmtVal` formats each part's value. */
+function mixBar(
+  box: HTMLElement,
+  parts: Array<{ label: string; v: number; color: string }>,
+  total: number,
+  fmtVal: (v: number) => string,
+  aria: string,
+  approx = false
+): void {
+  const stack = box.appendChild(el('div', 'stack'))
+  stack.setAttribute('role', 'img')
+  stack.setAttribute('aria-label', aria)
+  for (const part of parts) {
+    if (part.v <= 0) continue
+    const seg = stack.appendChild(el('i'))
+    seg.style.width = `${(part.v / total) * 100}%`
+    seg.style.background = part.color
+  }
+  const legend = box.appendChild(el('div', 'legend'))
+  for (const part of parts) {
+    const row = legend.appendChild(el('div', 'legend-row'))
+    const dot = row.appendChild(el('span', 'dot'))
+    dot.style.background = part.color
+    row.appendChild(el('span', 'legend-label xs', part.label))
+    row.appendChild(el('span', 'mono xs', fmtVal(part.v)))
+    row.appendChild(el('span', 'mono xs subtle legend-pct', `${approx ? '~' : ''}${Math.round((part.v / total) * 100)}%`))
+  }
+}
+
+
+function renderDetail(parent: HTMLElement, c: Ctx, s: SessionUsage): void {
+  const isCurrent = s.sessionId === currentSessionId
+  const name = sessionName(s, isCurrent)
+
+  const back = parent.appendChild(el('button', 'back'))
+  back.setAttribute('type', 'button')
+  back.appendChild(icon(ICON_ARROW_LEFT, 0.9))
+  back.appendChild(el('span', undefined, 'All sessions'))
+  back.addEventListener('click', () => {
+    detailId = null
+    repaint(true)
+  })
+
+  const head = parent.appendChild(el('section', 'sec'))
+  const title = head.appendChild(el('div', 'd-title'))
+  title.appendChild(el('span', name.isId ? 'mono muted' : 'd-name', name.text))
+  if (isCurrent) title.appendChild(el('span', 'mono now', 'now'))
+  const dir = projectDir(s)
+  if (dir) head.appendChild(el('div', 'mono xs subtle d-path', dir))
+
+  const span = Math.max(0, s.lastUsed - s.firstUsed)
+  const tools = toolCallsOf(s)
+  const grid = head.appendChild(el('div', 'tiles'))
+  const pre = isPreMetering(c.file, s)
+  grid.appendChild(
+    tile('Credits', estCr(s.estCredits), pre
+        ? 'pre-metering, likely too high'
+        : c.file.creditsSource === 'metered'
+          ? 'measured per response'
+          : 'share of the account total, by request',
+      { est: true }
+    )
+  )
+  grid.appendChild(tile('Requests', fmtInt(s.requests)))
+  grid.appendChild(
+    tile('Credits / request', s.requests > 0 ? estCr(s.estCredits / s.requests, 2) : null, undefined, { est: true })
+  )
+
+  const facts = head.appendChild(el('div', 'details'))
+  facts.appendChild(detailRow('Active', `${fmtAgo(s.firstUsed, c.now)} → ${fmtAgo(s.lastUsed, c.now)} · ${fmtDuration(span)}`))
+
+  const turnBox = section(parent, 'What it did', {
+    info:
+      'Responses of this session and its subagents. A tool turn ends with tool calls, so the agent keeps working; an answer is a plain reply; a failed turn ended in an error.'
+  })
+  const ts = turnSplit(s)
+  if (ts) {
+    const parts = [
+      { label: 'Tool turns', v: ts.toolUse, color: 'var(--oc-info)' },
+      { label: 'Answers', v: ts.answer, color: 'var(--oc-success)' },
+      { label: 'Failed', v: ts.error, color: 'var(--oc-error)' }
+    ]
+    mixBar(turnBox, parts, ts.total, (v) => fmtInt(v), 'Turn split: tool turns and answers')
+  } else {
+    turnBox.appendChild(notReported())
+  }
+
+  const tokBox = section(parent, 'Tokens', { est: true, src: 'plugin', info: TOKENS_INFO })
+  if (s.tokens) tokenBreakdown(tokBox, s.tokens, s.requests)
+  else tokBox.appendChild(notReported())
+
+  const toolBox = section(parent, 'Tools', {
+    right: tools != null ? el('span', 'xs subtle mono', `${fmtInt(tools)} calls`) : undefined
+  })
+  if (s.tools?.length) {
+    const sorted = [...s.tools].sort((a, b) => b.count - a.count)
+    const max = Math.max(1, ...sorted.map((t) => t.count))
+    const LIMIT = 8
+    const open = showAllSessionTools === s.sessionId
+    const list = toolBox.appendChild(el('div', 'tools'))
+    for (const t of open ? sorted : sorted.slice(0, LIMIT)) {
+      const row = list.appendChild(el('div', 'trow'))
+      const top = row.appendChild(el('div', 'trow-top'))
+      toolName(top, t.name)
+      top.appendChild(el('span', 'mono xs trow-nums', `×${fmtInt(t.count)}`))
+      row.appendChild(hbar(t.count / max, 'var(--oc-info)'))
+    }
+    if (sorted.length > LIMIT) {
+      const more = toolBox.appendChild(el('button', 'linkbtn', open ? 'Show fewer' : `Show all ${sorted.length} tools`))
+      more.setAttribute('type', 'button')
+      more.addEventListener('click', () => {
+        showAllSessionTools = open ? null : s.sessionId
+        repaint()
       })
-      .join('   ·   ')
-    row.appendChild(el('div', 'srow-split subtle', split))
+    }
+  } else if (tools != null) {
+    const n = toolBox.appendChild(el('div', 'xs subtle'))
+    n.appendChild(el('span', undefined, 'Per-tool breakdown: '))
+    n.appendChild(notReported())
+  } else {
+    toolBox.appendChild(notReported())
   }
+
+  // Worth a section whenever the session itself ran on more than one account,
+  // even if only one is still signed in: the other's share stays in the totals.
+  if (s.accounts && s.accounts.length > 1) {
+    const accBox = section(parent, 'Accounts used', {
+      est: true,
+      info: 'Credits are split per account from that account’s own usage changes.'
+    })
+    accBox.appendChild(
+      segBar(
+        s.accounts.map((a) => ({ value: a.estCredits, color: acctInfo(c, a.accountId).color })),
+        1
+      )
+    )
+    const list = accBox.appendChild(el('div', 'srow-accts-col'))
+    let goneCredits = 0
+    for (const a of [...s.accounts].sort((x, y) => y.estCredits - x.estCredits)) {
+      const info = acctInfo(c, a.accountId)
+      if (info.removed) goneCredits += a.estCredits
+      list.appendChild(acctChip(info, a.estCredits, a.requests))
+    }
+    if (goneCredits > 0) {
+      accBox.appendChild(
+        el(
+          'div',
+          'xs subtle',
+          `${estCr(goneCredits)} cr ran on an account that is no longer signed in.`
+        )
+      )
+    }
+  }
+
+  const actions = parent.appendChild(el('div', 'actions'))
+  const open = actions.appendChild(el('button', 'btn primary', 'Open session'))
+  open.setAttribute('type', 'button')
+  open.addEventListener('click', () => void host.openSession(s.sessionId).catch(() => {}))
+  const copy = actions.appendChild(el('button', 'btn', 'Copy session id'))
+  copy.setAttribute('type', 'button')
+  copy.addEventListener('click', () => {
+    void host.writeClipboard(s.sessionId).catch(() => {})
+    copy.textContent = 'Copied'
+    setTimeout(() => (copy.textContent = 'Copy session id'), 1500)
+  })
 }
 
 // ── plugin card + freshness ───────────────────────────────────────────────────
@@ -726,13 +1242,16 @@ function renderSessionRow(
 function renderPlugin(
   container: HTMLElement,
   installed: string | undefined,
-  instances: PluginInstance[]
+  instances: PluginInstance[],
+  hasInsights: boolean
 ): void {
+  // The latest version comes from the plugin in the snapshot (it has real network
+  // access), not from a panel-side request that would need a token integration.
   const versions = new Set(instances.map((i) => i.version))
   const split = versions.size > 1
-  const outdated =
-    !split && installed != null && latestVersion != null &&
-    compareSemver(installed, latestVersion) < 0
+  const known = latestVersion != null && installed != null
+  const outdated = !split && known && compareSemver(installed!, latestVersion!) < 0
+  const upToDate = !split && known && !outdated
 
   const card = container.appendChild(el('div', 'plugin-card'))
   const top = card.appendChild(el('div', 'plugin-top'))
@@ -743,12 +1262,20 @@ function renderPlugin(
 
   const right = top.appendChild(el('span', 'plugin-right'))
   right.appendChild(el('span', 'mono xs muted', installed ? `v${installed}` : 'version?'))
-  const badge = right.appendChild(
-    el('span', 'pill', split ? 'versions differ' : outdated ? 'update available' : 'up to date')
-  )
-  if (outdated || split) {
-    badge.style.color = toneVar('warning')
-    badge.style.background = 'color-mix(in srgb, var(--oc-warning, #e8935a) 14%, transparent)'
+  const label = split ? 'versions differ' : outdated ? 'update available' : upToDate ? 'up to date' : null
+  if (label) {
+    const badge = right.appendChild(el('span', 'pill', label))
+    if (outdated || split) {
+      badge.style.color = toneText('warning')
+      badge.style.background = 'color-mix(in srgb, var(--oc-warning) 14%, transparent)'
+    }
+  }
+
+  if (!hasInsights) {
+    const note = card.appendChild(el('div', 'plugin-note col'))
+    note.appendChild(
+      el('span', 'xs', 'This snapshot has no insight fields yet (requests, tokens, tools, daily trend, context). The plugin has to write them; the field list is in the README.')
+    )
   }
 
   if (outdated) {
@@ -765,9 +1292,7 @@ function renderPlugin(
 
   if (split) {
     const note = card.appendChild(el('div', 'plugin-note col'))
-    note.appendChild(
-      el('span', 'xs', `${versions.size} versions running — update every OpenCode install.`)
-    )
+    note.appendChild(el('span', 'xs', `${versions.size} versions running — update every OpenCode install.`))
     for (const i of instances) {
       const line = note.appendChild(el('div', 'inst-line'))
       line.appendChild(el('span', 'mono xs', `v${i.version}${i.self ? ' · here' : ''}`))
@@ -784,8 +1309,6 @@ function shortenPath(source: string | undefined): string | undefined {
 }
 
 function renderFreshness(container: HTMLElement, writtenAt: number): void {
-  // No manual refresh button: the panel repolls every POLL_MS and repaints on
-  // session changes on its own, so a button would only re-read the same file.
   const bar = container.appendChild(el('div', 'freshness'))
   const label = bar.appendChild(el('span', 'subtle xs'))
   let staleShown = false
@@ -795,7 +1318,7 @@ function renderFreshness(container: HTMLElement, writtenAt: number): void {
     if (age > STALE_MS && !staleShown) {
       staleShown = true
       const pill = bar.insertBefore(el('span', 'pill', 'cached'), bar.firstChild)
-      pill.style.color = toneVar('warning')
+      pill.style.color = toneText('warning')
       pill.style.marginRight = '0.4em'
     }
   }
@@ -804,29 +1327,38 @@ function renderFreshness(container: HTMLElement, writtenAt: number): void {
   mounted.push({ dispose: () => clearInterval(ticker) })
 }
 
+/** A slim notice above the content when the snapshot has not been refreshed lately. */
+function renderStaleNotice(parent: HTMLElement, writtenAt: number, now: number): void {
+  const age = now - writtenAt
+  if (age <= STALE_MS) return
+  const very = age > VERY_STALE_MS
+  const box = parent.appendChild(el('div', `stale${very ? ' stale-warn' : ''}`))
+  box.setAttribute('role', 'status')
+  box.appendChild(icon(very ? ICON_ALERT : ICON_CLOCK, 0.95))
+  box.appendChild(
+    el(
+      'span',
+      'xs',
+      very
+        ? `Last reading was ${fmtSpan(age)} ago. Figures may be outdated; start OpenCode with the Kiro plugin to refresh.`
+        : `Last reading ${fmtSpan(age)} ago. The plugin syncs after a request, so idle time shows as cached.`
+    )
+  )
+}
+
 // ── missing-file / waiting state ──────────────────────────────────────────────
 
 /**
- * What to show when kiro-usage.json is absent.
- *
- * The plugin writes this file during init — including when the startup usage
- * refresh fails — so a 2.2.0+ instance produces it within seconds of OpenCode
- * starting, before any request. A missing file therefore means no supported
- * instance has initialised yet: almost always the plugin is older than 2.2.0,
- * occasionally OpenCode is still starting. We fetch npm to say whether an
- * update is waiting, and the poll loop repaints on its own once the file lands.
+ * What to show when kiro-usage.json is absent. A 2.11.0+ plugin writes it during
+ * init, so a missing file almost always means an older plugin, occasionally that
+ * OpenCode is still starting; the poll repaints on its own once the file lands.
  */
-async function renderMissingFile(now: number): Promise<void> {
-  await refreshLatestVersion(now)
-  const behind = latestVersion != null && compareSemver(latestVersion, MIN_SUPPORTED_VERSION) >= 0
-  const body = behind
-    ? `Usage tracking needs ${PLUGIN_PKG} v${MIN_SUPPORTED_VERSION} or newer. The latest is v${latestVersion}. Update the plugin, then it appears within seconds of starting OpenCode.`
-    : `Usage tracking needs ${PLUGIN_PKG} v${MIN_SUPPORTED_VERSION} or newer. If OpenCode just started, this fills in within a few seconds.`
+function renderMissingFile(): void {
   mounted.push(
     mountBanner(root, {
       tone: 'warning',
       title: 'Waiting for the Kiro plugin',
-      body,
+      body: `Usage tracking needs ${PLUGIN_PKG} v${MIN_SUPPORTED_VERSION} or newer. If OpenCode just started, this fills in within a few seconds; otherwise update the plugin.`,
       action: {
         label: 'Copy update command',
         onClick: () => void host.writeClipboard(`npm install -g ${PLUGIN_PKG}@latest`).catch(() => {})
@@ -838,41 +1370,51 @@ async function renderMissingFile(now: number): Promise<void> {
 // ── data read + paint ─────────────────────────────────────────────────────────
 
 let lastFileKey = ''
-// The candidate path that last held the snapshot, tried first next time so a
-// steady state does not re-probe both locations on every poll.
-let resolvedUsageFile: string | null = null
 
+/**
+ * Read every candidate location and use the freshest snapshot.
+ *
+ * More than one can exist at once: a plugin run with XDG_CONFIG_HOME=~/.servoy
+ * writes there, while an earlier run (or another OpenCode install) left a file in
+ * ~/.config. Taking the first that exists would show a stale one, so all are read
+ * and the highest `writtenAt` wins. The files are small and read once per poll.
+ *
+ * A missing file is normal. A file that cannot be read or parsed is skipped when
+ * another candidate works, and only reported when none does.
+ */
 async function readUsageFile(): Promise<UsageFile> {
-  const order = resolvedUsageFile
-    ? [resolvedUsageFile, ...USAGE_FILES.filter((p) => p !== resolvedUsageFile)]
-    : USAGE_FILES
-  let lastError: unknown
-  for (const path of order) {
-    try {
-      const { content } = await host.readFile(path)
-      resolvedUsageFile = path
-      return JSON.parse(content) as UsageFile
-    } catch (error) {
-      lastError = error
-      if (error instanceof HostRequestError && error.code === 'NOT_FOUND') continue
-      throw error
-    }
+  const results = await Promise.all(
+    USAGE_FILES.map(async (path) => {
+      try {
+        const { content } = await host.readFile(path)
+        return { ok: true as const, file: JSON.parse(content) as UsageFile }
+      } catch (error) {
+        return { ok: false as const, error }
+      }
+    })
+  )
+
+  let best: UsageFile | null = null
+  for (const r of results) {
+    if (!r.ok) continue
+    if (!best || (r.file.writtenAt ?? 0) > (best.writtenAt ?? 0)) best = r.file
   }
-  resolvedUsageFile = null
-  throw lastError
+  if (best) return best
+
+  // Nothing readable. Prefer a real error over NOT_FOUND so a broken file is not
+  // mistaken for "plugin not installed".
+  const failures = results.flatMap((r) => (r.ok ? [] : [r.error]))
+  const real = failures.find((e) => !(e instanceof HostRequestError && e.code === 'NOT_FOUND'))
+  throw real ?? failures[0] ?? new Error('No usage file candidates')
 }
 
-// Serialise paints. onReady, onSession and the poll can all fire within the
-// same tick on a cold start; overlapping runs raced on lastFileKey and on
-// clear()/append, which could leave #root cleared-but-not-filled and then every
-// later poll SKIP'd on a matching key — an empty panel that only a data change
-// would recover. A single-slot queue guarantees paints run one at a time.
+// Serialise paints. onReady, onSession and the poll can all fire within the same
+// tick on a cold start; overlapping runs raced on lastFileKey and on clear()/
+// append. A single-slot queue guarantees paints run one at a time.
 let painting: Promise<void> | null = null
 let repaintQueued = false
 function paint(force = false): Promise<void> {
   if (painting) {
-    // Coalesce: remember that another paint is wanted, run it once the
-    // in-flight one finishes. A forced request wins.
     repaintQueued = repaintQueued || force
     return painting
   }
@@ -894,7 +1436,7 @@ async function paintOnce(force: boolean): Promise<void> {
     clear()
     lastFileKey = '' // never leave a key that would SKIP the recovery repaint
     if (error instanceof HostRequestError && error.code === 'NOT_FOUND') {
-      await renderMissingFile(Date.now())
+      renderMissingFile()
     } else {
       const msg = error instanceof HostRequestError ? `${error.code}: ${error.message}` : String(error)
       mounted.push(mountBanner(root, { tone: 'error', title: 'Could not read usage', body: msg }))
@@ -903,186 +1445,105 @@ async function paintOnce(force: boolean): Promise<void> {
   }
 
   const now = Date.now()
+  latestVersion = typeof file.latestVersion === 'string' ? file.latestVersion : latestVersion
+  // Older plugins omit the new fields entirely; normalise so views can rely on arrays.
+  file.accounts = Array.isArray(file.accounts) ? file.accounts : []
+  file.sessions = Array.isArray(file.sessions) ? file.sessions : []
 
-  // Backfill resetAt before computing the repaint key, so a snapshot that
-  // dropped it does not count as a different file (and the ETA stays stable).
-  for (const acc of file.accounts ?? []) {
-    if (typeof acc.resetAt === 'number') lastResetAt.set(acc.id, acc.resetAt)
-    else {
+  // Backfill resetAt before computing the repaint key, so a snapshot that dropped
+  // it does not count as a different file (and the projection stays stable).
+  for (const acc of file.accounts) {
+    if (typeof acc.resetAt === 'number') {
+      if (lastResetAt.get(acc.id) !== acc.resetAt) {
+        lastResetAt.set(acc.id, acc.resetAt)
+        saveResetAt()
+      }
+    } else {
       const known = lastResetAt.get(acc.id)
       if (known != null) acc.resetAt = known
     }
   }
 
-  // Repaint key includes UI state that changes what is drawn but not the file.
-  const key = JSON.stringify(file) + `|${detailsOpen}|${accountIdx}|${currentSessionId ?? ''}|${latestVersion ?? ''}`
+  const key =
+    JSON.stringify(file) +
+    `|${detailsOpen}|${accountIdx}|${currentSessionId ?? ''}|${detailId ?? ''}|${sortMode}|${rangeDays}|${showAllTools}|${showAllSessionTools ?? "-"}`
   if (!force && key === lastFileKey) return
 
-  // The npm version check is a network call (up to 20s, can hang offline). It
-  // must NOT gate the paint — render the file data right away and check the
-  // version in the background, repainting only when it actually changed.
-  void refreshLatestVersion(now).then((changed) => {
-    if (changed) void paint(true)
-  })
+  // Keep the scroll position across a repaint so a poll never makes the panel jump.
+  const scrollTop = resetScrollNext ? 0 : root.scrollTop
+  resetScrollNext = false
 
   // Render synchronously from here down — no awaits — so the key is only set
   // after #root is fully populated, and clear()+append cannot be interleaved.
   clear()
 
-  if (!file.accounts?.length) {
+  if (!file.accounts.length) {
     lastFileKey = key
-    mounted.push(
-      mountEmpty(root, { title: 'No Kiro accounts', body: 'Sign in to Kiro in OpenCode first.' })
-    )
+    mounted.push(mountEmpty(root, { title: 'No Kiro accounts', body: 'Sign in to Kiro in OpenCode first.' }))
     return
   }
 
-  // Layout: #root is a fixed-height flex column. The account card and the
-  // "Recent sessions" heading stay put; only the session rows scroll; the
-  // footer (plugin card + freshness) stays pinned at the bottom. So just the
-  // list of rows takes the flexible middle space — everything else is fixed.
+  const idx = ((accountIdx % file.accounts.length) + file.accounts.length) % file.accounts.length
+  const acc = file.accounts[idx]!
+  // A burn[] that is still filling up after the metering switch is not a pace: drop it, so the
+  // projection falls back to the exact month average instead of "≈ 11 cr/day, plenty left".
+  const burn = recentBurn(file, acc, now)
+  const c: Ctx = {
+    file,
+    now,
+    emailById: new Map(file.accounts.map((a) => [a.id, a.email])),
+    acc,
+    burn,
+    proj: projectionFor(acc, burn, now)
+  }
+
   const wrap = root.appendChild(el('div', 'wrap'))
-  renderAccountCard(wrap, file.accounts, file.sessions ?? [], now)
-  const emailById = new Map(file.accounts.map((a) => [a.id, a.email]))
-  renderSessions(wrap, file.sessions ?? [], emailById)
+  renderStaleNotice(wrap, file.writtenAt || now, now)
+
+  const detail = detailId ? file.sessions.find((s) => s.sessionId === detailId) : undefined
+  if (detailId && !detail) detailId = null // the session aged out of the capped list
+
+  if (detail) {
+    const col = wrap.appendChild(el('div', 'col detail'))
+    renderDetail(col, c, detail)
+  } else {
+    const layout = wrap.appendChild(el('div', 'layout'))
+    const a = layout.appendChild(el('div', 'col'))
+    const b = layout.appendChild(el('div', 'col'))
+    renderAccountChips(a, c)
+    renderHero(a, c)
+    renderTiles(a, c)
+    renderTrend(a, c)
+    renderTokens(a, c)
+    renderAccounts(a, c)
+    renderTools(b, c)
+    renderSessions(b, c)
+  }
 
   const footer = wrap.appendChild(el('div', 'footer'))
-  renderPlugin(footer, file.pluginVersion, file.pluginInstances ?? [])
+  const hasInsights = hasInsightFields(file)
+  renderPlugin(footer, file.pluginVersion, file.pluginInstances ?? [], hasInsights)
   renderFreshness(footer, file.writtenAt || now)
 
+  root.scrollTop = scrollTop
   // Key set only now, after #root is fully populated — never mid-render.
   lastFileKey = key
 }
 
-// ── styles ────────────────────────────────────────────────────────────────────
+// ── host wiring ───────────────────────────────────────────────────────────────
 
 function injectStyles(): void {
   const style = document.createElement('style')
-  // Colours use OpenChamber's own tokens so the panel matches the app's theme
-  // in light or dark; numbers use the host mono token. Sizes track the host
-  // font (applyHostReady sets ~0.875rem on the root).
-  style.textContent = `
-    /* Lock the panel to the rail width so no child (a long path, a wide title)
-       can widen it, which showed as the panel jumping wider on session switch. */
-    #root { color: var(--oc-fg); max-width: 100%; height: 100%; overflow: hidden; box-sizing: border-box; }
-    .mono { font-family: var(--oc-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-    .muted { color: var(--oc-muted, #8b8b93); }
-    /* Readable secondary text. Maps to the host's muted token (~5:1 on both
-       themes), NOT --oc-subtle: that token is ~2.8:1, fine for borders and
-       icons but unreadable as body text on a dark background. */
-    .subtle { color: var(--oc-muted, #8b8b93); }
-    .xs { font-size: 0.8em; }
-    .ico { flex-shrink: 0; }
-    /* Fill the panel height so the freshness line can anchor to the bottom via
-       margin-top:auto; min-height:100% (not height) lets it grow past the
-       viewport and scroll when content is tall. */
-    /* Full-height column: account card + footer fixed, only the session rows
-       scroll. The sessions-section takes the flexible middle; its heading stays
-       and its .sessions list is the actual scroll area. */
-    .wrap { display: flex; flex-direction: column; gap: 1.3em; max-width: 100%; min-width: 0; height: 100%; box-sizing: border-box; }
-    .sessions-section { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-
-    .card { display: flex; flex-direction: column; gap: 0.75em; padding: 1.1em; border-radius: 0.72em; background: var(--oc-elevated, rgba(127,127,127,0.06)); border: 1px solid var(--oc-border, transparent); }
-    .acc-head { display: flex; align-items: center; gap: 0.6em; }
-    .avatar { width: 1.35em; height: 1.35em; border-radius: 999px; background: var(--oc-hover, rgba(127,127,127,0.12)); display: flex; align-items: center; justify-content: center; font-size: 0.7em; font-weight: 700; color: var(--oc-muted, #888); flex-shrink: 0; }
-    .acc-email { font-size: 0.95em; font-weight: 500; color: var(--oc-muted, #888); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
-    .pill { font-size: 0.72em; color: var(--oc-muted, #888); background: var(--oc-hover, rgba(127,127,127,0.12)); border-radius: 999px; padding: 0.15em 0.6em; flex-shrink: 0; white-space: nowrap; }
-    .pill-error { color: var(--oc-error, #e05252); background: color-mix(in srgb, var(--oc-error, #e05252) 14%, transparent); }
-
-    .acc-body { display: flex; align-items: center; gap: 1.15em; }
-    .donut { flex-shrink: 0; }
-    .acc-figures { display: flex; flex-direction: column; gap: 0.45em; min-width: 0; flex: 1; }
-    .big { font-size: 1.3em; font-weight: 600; }
-    .hr { height: 1px; background: var(--oc-border, #333); }
-    .fig-row { display: flex; align-items: center; gap: 0.4em; color: var(--oc-muted, #8b8b93); }
-    .fig-row .mono { color: var(--oc-muted, #888); }
-
-    .details-toggle { align-self: center; display: flex; align-items: center; gap: 0.3em; font-size: 0.78em; color: var(--oc-muted, #8b8b93); background: transparent; border: 0; padding: 0.15em 0.6em; border-radius: 0.45em; cursor: pointer; }
-    .details-toggle:hover { background: var(--oc-hover, rgba(127,127,127,0.12)); }
-    .details-toggle .ico { transition: transform 0.15s ease; }
-    .details { display: flex; flex-direction: column; gap: 0.45em; padding-top: 0.6em; border-top: 1px solid var(--oc-border, #333); }
-    .detail-row { display: flex; align-items: center; justify-content: space-between; gap: 0.8em; }
-
-    .pager { display: flex; align-items: center; justify-content: center; gap: 0.9em; margin-top: 0.15em; }
-    .navbtn { width: 1.7em; height: 1.7em; border-radius: 0.45em; border: 0; background: transparent; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--oc-muted, #8b8b93); padding: 0; }
-    .navbtn:hover { background: var(--oc-hover, rgba(127,127,127,0.12)); color: var(--oc-fg); }
-    .dots { display: flex; align-items: center; gap: 0.45em; }
-    .dot { width: 0.45em; height: 0.45em; border-radius: 999px; background: var(--oc-border, #333); }
-    .dot-on { background: var(--oc-primary, #e8935a); }
-
-    .sec-head { margin-bottom: 0.3em; display: flex; align-items: center; gap: 0.4em; }
-    .sec-title { font-size: 0.92em; font-weight: 600; }
-    /* The wrap is static; the tooltip anchors to the panel (#root), not the icon,
-       so it spans the full rail with margins and stays readable wherever the icon
-       sits — a right/left-aligned bubble clipped off-panel for the mid-row icons. */
-    .info-wrap { display: inline-flex; align-items: center; cursor: help; flex-shrink: 0; outline: none; }
-    .info-ico { color: var(--oc-muted, #8b8b93); flex-shrink: 0; }
-    .info-wrap:hover .info-ico, .info-wrap:focus-visible .info-ico { color: var(--oc-fg); }
-    #root { position: relative; }
-    .tip { position: absolute; left: 12px; right: 12px; z-index: 20; padding: 0.55em 0.7em; border-radius: 0.5em; background: var(--oc-elevated, #1c1c20); color: var(--oc-fg, #e9e9ec); border: 1px solid var(--oc-border, #333); box-shadow: 0 4px 16px rgba(0,0,0,0.35); font-size: 0.78em; line-height: 1.45; font-weight: 400; white-space: normal; opacity: 0; visibility: hidden; transition: opacity 0.12s ease; pointer-events: none; }
-    .info-wrap:hover .tip, .info-wrap:focus-visible .tip { opacity: 1; visibility: visible; }
-    /* Everything below constrains the session rows so a long path or title can
-       never push the panel wider than its rail. The whole panel is width-locked
-       (see #root) and each row + its children carry min-width:0 so ellipsis
-       actually kicks in instead of the element demanding its full text width. */
-    .sessions { display: flex; flex-direction: column; min-width: 0; max-width: 100%; flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
-    /* Fixed row height so every row is the same, whether it shows a path or not.
-       Tall enough for the two-line case (title + path); one-line rows center in
-       the same box. min-height keeps it even if a font makes lines taller. */
-    .srow { display: flex; flex-direction: column; justify-content: center; gap: 0.2em; width: 100%; min-width: 0; max-width: 100%; height: 3.9em; min-height: 3.9em; box-sizing: border-box; text-align: left; padding: 0.5em; border: 0; border-left: 2px solid transparent; border-bottom: 1px solid var(--oc-border, #28282d); background: transparent; color: inherit; font: inherit; cursor: pointer; transition: background 0.12s ease; }
-    .srow:last-child { border-bottom: 0; }
-    .srow:hover { background: var(--oc-hover, rgba(127,127,127,0.1)); }
-    .srow.current { border-left-color: var(--oc-primary, #e8935a); }
-    .srow-top { display: flex; align-items: baseline; justify-content: space-between; gap: 0.8em; min-width: 0; }
-    .srow-name { display: flex; align-items: center; gap: 0.45em; min-width: 0; flex: 1; }
-    .srow-title { font-size: 1em; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-    .srow-title.muted { font-weight: 400; }
-    .now { font-size: 0.72em; font-weight: 600; color: var(--oc-primary, #e8935a); flex-shrink: 0; }
-    .srow-figures { font-size: 0.92em; flex-shrink: 0; white-space: nowrap; }
-    .srow-credits { font-weight: 500; }
-    /* width:0 + min-width:0 makes the row's width the authority; the block then
-       fills it and ellipsis-clips, instead of overflow-wrap letting the text
-       claim its natural width (which reported a 430px scrollWidth on a 360 rail). */
-    .srow-path { font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; width: 100%; min-width: 0; box-sizing: border-box; }
-    .srow-split { font-size: 0.76em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; width: 100%; min-width: 0; box-sizing: border-box; }
-    .caption { font-size: 0.76em; line-height: 1.5; margin-top: 0.6em; }
-
-    .plugin-card { display: flex; flex-direction: column; gap: 0.6em; padding: 0.75em 0.9em; border-radius: 0.55em; background: var(--oc-elevated, rgba(127,127,127,0.06)); border: 1px solid var(--oc-border, transparent); }
-    .plugin-top { display: flex; align-items: center; justify-content: space-between; gap: 0.8em; }
-    .plugin-id { display: flex; align-items: center; gap: 0.5em; min-width: 0; }
-    .dot { width: 0.45em; height: 0.45em; border-radius: 999px; flex-shrink: 0; }
-    .plugin-name { font-size: 0.9em; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .plugin-right { display: flex; align-items: center; gap: 0.45em; flex-shrink: 0; }
-    .plugin-note { display: flex; align-items: center; justify-content: space-between; gap: 0.7em; padding: 0.5em 0.6em; border-radius: 0.45em; background: color-mix(in srgb, var(--oc-warning, #e8935a) 12%, transparent); }
-    .plugin-note.col { flex-direction: column; align-items: stretch; gap: 0.35em; }
-    .inst-line { display: flex; align-items: center; justify-content: space-between; gap: 0.6em; }
-
-    /* The footer (plugin card + freshness) anchors to the panel bottom; the
-       account/sessions above take their natural height and this fills the rest. */
-    .footer { display: flex; flex-direction: column; gap: 1.3em; min-width: 0; flex-shrink: 0; }
-    .freshness { display: flex; align-items: center; justify-content: center; padding: 0.2em 0.15em 0; }
-    .linkbtn { font-size: 0.82em; font-weight: 500; color: var(--oc-warning, #e8935a); background: transparent; border: 0; padding: 0.2em 0.5em; border-radius: 0.4em; cursor: pointer; flex-shrink: 0; }
-    .linkbtn:hover { background: var(--oc-hover, rgba(127,127,127,0.12)); }
-    .linkbtn.primary { color: var(--oc-primary, #e8935a); }
-  `
+  style.textContent = STYLES
   document.head.appendChild(style)
 }
-
-// ── host wiring ───────────────────────────────────────────────────────────────
 
 /**
  * Subscribe to every project's sessions and learn their titles.
  *
- * The session rows come from the plugin snapshot, which does not carry a title,
- * so a row fell back to its directory basename (every subagent showed up as the
- * folder name, e.g. "svyCloud"). `onSession` only ever reports the *active*
- * session's title — a subagent never becomes active, so clicking a row was the
- * only way its name appeared, and it was lost again on navigation.
- *
- * `host.onSessions(projectId)` instead lists ALL sessions with their id + title.
- * Feeding those into the persistent title cache gives every row — subagents
- * included — its real name, kept across reloads. All projects are tracked so a
- * session belonging to another project still resolves.
+ * `onSession` only reports the *active* session's title, so subagents showed up
+ * as their folder name. `host.onSessions(projectId)` lists ALL sessions with id +
+ * title; feeding those into the persistent title cache names every row.
  */
 async function trackSessionTitles(): Promise<void> {
   try {
@@ -1097,8 +1558,7 @@ async function trackSessionTitles(): Promise<void> {
             if (before !== s.title) learned = true
           }
         }
-        // Repaint when a title changed so rows update without a click.
-        void paint(learned)
+        if (learned) void paint(true)
       })
     }
   } catch {
@@ -1128,4 +1588,12 @@ host.onSession((session) => {
   currentSessionId = next
   currentSessionTitle = nextTitle
   void paint(true)
+})
+
+// Escape leaves the drill-down, like the back button.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && detailId) {
+    detailId = null
+    repaint(true)
+  }
 })

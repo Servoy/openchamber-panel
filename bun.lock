@@ -5,7 +5,7 @@
     "": {
       "name": "@servoy/kiro-usage-panel",
       "dependencies": {
-        "@openchamber/sdk": "^1.24.1",
+        "@openchamber/sdk": "2.7.2",
       },
       "devDependencies": {
         "typescript": "^7.0.2",
@@ -13,7 +13,7 @@
     },
   },
   "packages": {
-    "@openchamber/sdk": ["@openchamber/sdk@1.24.1", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-Ksw9pPy4ooRDJhd5mQeuiFcEkZCYiGyM21LsGl8hdqaGadewWvFTGsRQQoaciCllFc4l65IE4KcZRSnbSM4GEA=="],
+    "@openchamber/sdk": ["@openchamber/sdk@2.7.2", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-check": "scripts/check-guest.ts", "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-kX1YjaSywIXYuHPJIcMMnwfTG35PeI1FVO9g853denAeBCj5sl1Wda8YfIxM0Lv+bfqFrEiZ4NXifIuNVWxTRA=="],
 
     "@typescript/typescript-aix-ppc64": ["@typescript/typescript-aix-ppc64@7.0.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ=="],
 
